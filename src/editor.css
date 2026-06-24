@@ -1,0 +1,237 @@
+#editor-panel {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  bottom: 16px;
+  width: 300px;
+  background: rgba(15, 15, 15, 0.95);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 20px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+.editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.editor-header h2 {
+  color: #fff;
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.editor-badge {
+  background: #00ffaa;
+  color: #000;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 4px;
+  letter-spacing: 1px;
+}
+
+.editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ed-btn {
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #ccc;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.ed-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.ed-btn-primary {
+  background: rgba(0, 255, 170, 0.15);
+  border-color: rgba(0, 255, 170, 0.4);
+  color: #00ffaa;
+}
+
+.ed-btn-primary:hover {
+  background: rgba(0, 255, 170, 0.25);
+}
+
+.ed-btn-accent {
+  background: rgba(68, 136, 255, 0.15);
+  border-color: rgba(68, 136, 255, 0.4);
+  color: #4488ff;
+}
+
+.ed-btn-accent:hover {
+  background: rgba(68, 136, 255, 0.25);
+}
+
+.ed-btn-active {
+  background: rgba(255, 200, 0, 0.15);
+  border-color: rgba(255, 200, 0, 0.4);
+  color: #ffcc00;
+}
+
+.editor-scrubber {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.editor-scrubber label {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.editor-scrubber input[type="range"] {
+  width: 100%;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.editor-scrubber input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #00ffaa;
+  cursor: pointer;
+}
+
+.editor-scrubber input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #00ffaa;
+  border: none;
+  cursor: pointer;
+}
+
+.editor-info {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 12px;
+}
+
+.editor-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ed-keyframe-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.ed-kf-index {
+  color: #00ffaa;
+  font-weight: 600;
+  min-width: 24px;
+}
+
+.ed-kf-pos {
+  flex: 1;
+  font-family: 'SF Mono', Monaco, monospace;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.ed-kf-goto,
+.ed-kf-delete {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+
+.ed-kf-goto {
+  background: rgba(68, 136, 255, 0.2);
+  color: #4488ff;
+}
+
+.ed-kf-goto:hover {
+  background: rgba(68, 136, 255, 0.4);
+}
+
+.ed-kf-delete {
+  background: rgba(255, 68, 68, 0.2);
+  color: #ff4444;
+}
+
+.ed-kf-delete:hover {
+  background: rgba(255, 68, 68, 0.4);
+}
+
+/* Scrollbar */
+.editor-list::-webkit-scrollbar {
+  width: 4px;
+}
+
+.editor-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.editor-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}
+
+/* Hide normal UI in editor mode */
+body.editor-mode #ui-overlay {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  #editor-panel {
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: 100%;
+    height: 50vh;
+    border-radius: 12px 12px 0 0;
+  }
+}

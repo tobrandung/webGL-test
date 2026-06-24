@@ -1,60 +1,67 @@
 import * as THREE from 'three';
 
-type Keyframe = {
+export type Keyframe = {
   position: [number, number, number];
   lookAt: [number, number, number];
 };
 
-// Cinematic Keyframes mit variablem Abstand, Hoehe und Blickrichtung
-const KEYFRAMES: Keyframe[] = [
-  // 0% — Hero Shot: Front 3/4, mittlere Distanz
-  { position: [3.5, 1.0, 4.0], lookAt: [0, 0.2, 0] },
-
-  // ~8% — Zoom-In auf Front/Kuehler
-  { position: [1.5, 0.5, 3.0], lookAt: [0, 0.1, 0.5] },
-
-  // ~16% — Ganz nah, Low-Angle von vorne
-  { position: [0.3, 0.3, 2.5], lookAt: [0, 0.3, -0.5] },
-
-  // ~24% — Flyover: Hoch ueber die Motorhaube
-  { position: [0.0, 2.8, 1.5], lookAt: [0, 0, -0.5] },
-
-  // ~32% — Flyover Mitte: Draufsicht leicht versetzt
-  { position: [-0.5, 3.0, -0.5], lookAt: [0, 0, 0] },
-
-  // ~40% — Runterkommen zur Seite rechts
-  { position: [-3.5, 1.0, -2.0], lookAt: [0, 0.2, 0] },
-
-  // ~50% — Seite rechts, Profilansicht
-  { position: [-4.5, 0.8, 0.0], lookAt: [0, 0.2, 0] },
-
-  // ~58% — Heck 3/4 nah
-  { position: [-3.0, 1.2, 2.5], lookAt: [0, 0.3, 0] },
-
-  // ~66% — Heck, etwas erhoeht
-  { position: [-1.0, 1.5, 4.5], lookAt: [0, 0.2, 0] },
-
-  // ~74% — Schwenk zur linken Seite
-  { position: [2.5, 0.8, 3.5], lookAt: [0, 0.1, 0] },
-
-  // ~82% — Seite links, mittlere Distanz
-  { position: [4.5, 1.0, 0.5], lookAt: [0, 0.2, 0] },
-
-  // ~90% — Zurueck zum Start, weiter weg, erhoeht
-  { position: [4.0, 1.5, -2.0], lookAt: [0, 0.2, 0] },
-];
-
-const positionPoints = KEYFRAMES.map(kf => new THREE.Vector3(...kf.position));
-const lookAtPoints = KEYFRAMES.map(kf => new THREE.Vector3(...kf.lookAt));
-
-const positionSpline = new THREE.CatmullRomCurve3(positionPoints, true, 'centripetal', 0.5);
-const lookAtSpline = new THREE.CatmullRomCurve3(lookAtPoints, true, 'centripetal', 0.5);
+export type CameraPathConfig = {
+  keyframes: Keyframe[];
+  loop: boolean;
+};
 
 export type CameraPathState = {
   progress: number;
   targetProgress: number;
   heightOffset: number;
 };
+
+let positionSpline: THREE.CatmullRomCurve3 | null = null;
+let lookAtSpline: THREE.CatmullRomCurve3 | null = null;
+let isLoop = true;
+
+const DEFAULT_KEYFRAMES: Keyframe[] = [
+  { position: [3.5, 1.0, 4.0], lookAt: [0, 0.2, 0] },
+  { position: [1.5, 0.5, 3.0], lookAt: [0, 0.1, 0.5] },
+  { position: [0.3, 0.3, 2.5], lookAt: [0, 0.3, -0.5] },
+  { position: [0.0, 2.8, 1.5], lookAt: [0, 0, -0.5] },
+  { position: [-0.5, 3.0, -0.5], lookAt: [0, 0, 0] },
+  { position: [-3.5, 1.0, -2.0], lookAt: [0, 0.2, 0] },
+  { position: [-4.5, 0.8, 0.0], lookAt: [0, 0.2, 0] },
+  { position: [-3.0, 1.2, 2.5], lookAt: [0, 0.3, 0] },
+  { position: [-1.0, 1.5, 4.5], lookAt: [0, 0.2, 0] },
+  { position: [2.5, 0.8, 3.5], lookAt: [0, 0.1, 0] },
+  { position: [4.5, 1.0, 0.5], lookAt: [0, 0.2, 0] },
+  { position: [4.0, 1.5, -2.0], lookAt: [0, 0.2, 0] },
+];
+
+export function buildSplines(keyframes: Keyframe[], loop: boolean): void {
+  if (keyframes.length < 2) {
+    positionSpline = null;
+    lookAtSpline = null;
+    return;
+  }
+
+  isLoop = loop;
+  const posPoints = keyframes.map(kf => new THREE.Vector3(...kf.position));
+  const lookPoints = keyframes.map(kf => new THREE.Vector3(...kf.lookAt));
+
+  positionSpline = new THREE.CatmullRomCurve3(posPoints, loop, 'centripetal', 0.5);
+  lookAtSpline = new THREE.CatmullRomCurve3(lookPoints, loop, 'centripetal', 0.5);
+}
+
+export function loadKeyframesFromJSON(config: CameraPathConfig): void {
+  buildSplines(config.keyframes, config.loop);
+}
+
+export function getSplinePoints(divisions: number = 200): THREE.Vector3[] {
+  if (!positionSpline) return [];
+  return positionSpline.getPoints(divisions);
+}
+
+export function getPositionSpline(): THREE.CatmullRomCurve3 | null {
+  return positionSpline;
+}
 
 export function createCameraPathState(): CameraPathState {
   return {
@@ -69,10 +76,17 @@ export function updateCameraFromPath(
   state: CameraPathState,
   deltaTime: number
 ): void {
+  if (!positionSpline || !lookAtSpline) return;
+
   const lerpSpeed = 1 - Math.pow(0.005, deltaTime);
   state.progress += (state.targetProgress - state.progress) * lerpSpeed;
 
-  const t = ((state.progress % 1) + 1) % 1;
+  let t: number;
+  if (isLoop) {
+    t = ((state.progress % 1) + 1) % 1;
+  } else {
+    t = Math.max(0, Math.min(1, state.progress));
+  }
 
   const pos = positionSpline.getPointAt(t);
   pos.y += state.heightOffset;
@@ -82,3 +96,6 @@ export function updateCameraFromPath(
   camera.position.copy(pos);
   camera.lookAt(lookTarget);
 }
+
+// Initialize with default keyframes
+buildSplines(DEFAULT_KEYFRAMES, true);
