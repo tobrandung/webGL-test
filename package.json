@@ -1,0 +1,24 @@
+{
+  "name": "webgl-test",
+  "version": "1.0.0",
+  "description": "Interactive 3D Porsche 911 Viewer with WebGL",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "optimize-glb": "gltf-transform optimize assets/free_1975_porsche_911_930_turbo.glb assets/porsche-911.glb --compress draco --texture-compress webp"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "three": "^0.184.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.0"
+  },
+  "devDependencies": {
+    "@gltf-transform/cli": "^4.4.0",
+    "@types/three": "^0.184.1"
+  }
+}
