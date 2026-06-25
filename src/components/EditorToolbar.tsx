@@ -1,0 +1,171 @@
+import { ArrowLeft, Plus, Move, RotateCw, Maximize, Video, Undo2, Redo2, Share } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { Button } from '@/components/ui/button';
+import { Separator } from '@/components/ui/separator';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
+import type { TransformMode } from '@/three/viewport';
+import type { HistoryState } from '@/hooks/useHistory';
+
+type EditorToolbarProps = {
+  transformMode: TransformMode;
+  onTransformModeChange: (mode: TransformMode) => void;
+  onAddModel: () => void;
+  onOpenKeyframeEditor: () => void;
+  onExport: () => void;
+  onBack: () => void;
+  onUndo: () => void;
+  onRedo: () => void;
+  history: HistoryState;
+  projectName: string;
+  saveStatus: 'saved' | 'saving' | 'dirty';
+  hasKeyframes: boolean;
+};
+
+export function EditorToolbar({
+  transformMode,
+  onTransformModeChange,
+  onAddModel,
+  onOpenKeyframeEditor,
+  onExport,
+  onBack,
+  onUndo,
+  onRedo,
+  history,
+  projectName,
+  saveStatus,
+  hasKeyframes,
+}: EditorToolbarProps) {
+  return (
+    <div className="absolute left-0 right-0 top-0 z-10 flex items-center gap-1 border-b bg-background/80 px-3 py-1.5 backdrop-blur-sm">
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button variant="ghost" size="icon" onClick={onBack} aria-label="Zurück zum Dashboard">
+            <ArrowLeft className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Zurück</TooltipContent>
+      </Tooltip>
+
+      <span className="mr-1 text-sm font-medium">{projectName}</span>
+      {saveStatus === 'saved' && (
+        <span className="text-xs text-muted-foreground">Gespeichert</span>
+      )}
+      {saveStatus === 'saving' && (
+        <span className="text-xs text-muted-foreground">Speichert…</span>
+      )}
+      {saveStatus === 'dirty' && (
+        <span className="inline-block h-2 w-2 rounded-full bg-orange-400" title="Ungespeicherte Änderungen" />
+      )}
+
+      <Separator orientation="vertical" className="mx-1.5 h-6" />
+
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button variant="ghost" size="icon" onClick={onUndo} disabled={!history.canUndo} aria-label="Rückgängig">
+            <Undo2 className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{history.canUndo ? `Rückgängig: ${history.undoLabel}` : 'Rückgängig (Cmd+Z)'}</TooltipContent>
+      </Tooltip>
+
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button variant="ghost" size="icon" onClick={onRedo} disabled={!history.canRedo} aria-label="Wiederholen">
+            <Redo2 className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{history.canRedo ? `Wiederholen: ${history.redoLabel}` : 'Wiederholen (Cmd+Shift+Z)'}</TooltipContent>
+      </Tooltip>
+
+      <Separator orientation="vertical" className="mx-1.5 h-6" />
+
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant={transformMode === 'translate' ? 'secondary' : 'ghost'}
+            size="icon"
+            onClick={() => onTransformModeChange('translate')}
+            aria-label="Verschieben"
+          >
+            <Move className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Verschieben (G)</TooltipContent>
+      </Tooltip>
+
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant={transformMode === 'rotate' ? 'secondary' : 'ghost'}
+            size="icon"
+            onClick={() => onTransformModeChange('rotate')}
+            aria-label="Rotieren"
+          >
+            <RotateCw className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Rotieren (R)</TooltipContent>
+      </Tooltip>
+
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant={transformMode === 'scale' ? 'secondary' : 'ghost'}
+            size="icon"
+            onClick={() => onTransformModeChange('scale')}
+            aria-label="Skalieren"
+          >
+            <Maximize className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Skalieren (S)</TooltipContent>
+      </Tooltip>
+
+      <Separator orientation="vertical" className="mx-1.5 h-6" />
+
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button variant="ghost" size="sm" onClick={onAddModel}>
+            <Plus className="mr-1 h-4 w-4" />
+            Modell
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Modell hinzufügen</TooltipContent>
+      </Tooltip>
+
+      <div className="flex-1" />
+
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button variant="outline" size="sm" onClick={onOpenKeyframeEditor}>
+            <Video className="mr-1 h-4 w-4" />
+            Kamerafahrt
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Keyframe Editor öffnen</TooltipContent>
+      </Tooltip>
+
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onExport}
+            disabled={!hasKeyframes}
+            aria-label="Exportieren"
+          >
+            <Share className="mr-1 h-4 w-4" />
+            Exportieren
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          {hasKeyframes ? 'Als Widget exportieren' : 'Erstelle zuerst eine Kamerafahrt'}
+        </TooltipContent>
+      </Tooltip>
+    </div>
+  );
+}
