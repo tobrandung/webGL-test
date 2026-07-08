@@ -2,13 +2,25 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 
+type Vec3 = [number, number, number];
+
+type ModelConfig = {
+  url: string;
+  position?: Vec3;
+  rotation?: Vec3;
+  scale?: Vec3;
+};
+
 type WidgetConfig = {
   mode: 'scroll' | 'autoplay' | 'loop';
   transparent?: boolean;
   background?: string;
-  keyframes: Array<{ position: [number, number, number]; lookAt: [number, number, number] }>;
+  keyframes: Array<{ position: Vec3; lookAt: Vec3 }>;
   isLoop: boolean;
   speed: number;
+  /** Mehrere Modelle mit Transform. */
+  models?: ModelConfig[];
+  /** Rückwärtskompatibel: einzelnes Modell. */
   modelUrl?: string;
 };
 
@@ -22,19 +34,26 @@ function buildSplines(keyframes: WidgetConfig['keyframes'], isLoop: boolean) {
   };
 }
 
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
 function init(selector: string, config: WidgetConfig) {
-  const container = document.querySelector(selector);
+  const container = document.querySelector<HTMLElement>(selector);
   if (!container) {
-    console.error('[Web3DWidget] Container not found:', selector);
+    console.error('[Web3DWidget] Container nicht gefunden:', selector);
     return;
   }
 
-  const scene = new THREE.Scene();
-  if (config.transparent) {
-    scene.background = null;
-  } else {
-    scene.background = new THREE.Color(config.background ?? '#1a1a1a');
+  if (config.keyframes.length < 2) {
+    console.warn(
+      '[Web3DWidget] Weniger als 2 Keyframes – es findet keine Kamerafahrt statt. ' +
+        'Erstelle im Editor mindestens 2 Keyframes und exportiere erneut.',
+    );
   }
+
+  const scene = new THREE.Scene();
+  scene.background = config.transparent ? null : new THREE.Color(config.background ?? '#1a1a1a');
 
   const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
   camera.position.set(3, 2, 5);
@@ -54,63 +73,77 @@ function init(selector: string, config: WidgetConfig) {
   const fill = new THREE.DirectionalLight(0xb4c6e0, 0.6);
   fill.position.set(-3, 4, -2);
   scene.add(fill);
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x1a1a1a, 0.3);
+  scene.add(hemi);
 
-  if (config.modelUrl) {
-    const loader = new GLTFLoader();
-    const draco = new DRACOLoader();
-    draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
-    loader.setDRACOLoader(draco);
-    loader.load(config.modelUrl, (gltf) => {
-      const wrapper = new THREE.Group();
-      wrapper.add(gltf.scene);
-      const box = new THREE.Box3().setFromObject(wrapper);
-      const center = box.getCenter(new THREE.Vector3());
-      gltf.scene.position.sub(center);
-      scene.add(wrapper);
-      draco.dispose();
-    });
-  }
+  const loader = new GLTFLoader();
+  const draco = new DRACOLoader();
+  draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+  loader.setDRACOLoader(draco);
+
+  const modelList: ModelConfig[] = config.models ?? (config.modelUrl ? [{ url: config.modelUrl }] : []);
+
+  modelList.forEach((m) => {
+    loader.load(
+      m.url,
+      (gltf) => {
+        const wrapper = new THREE.Group();
+        wrapper.add(gltf.scene);
+        const box = new THREE.Box3().setFromObject(wrapper);
+        const center = box.getCenter(new THREE.Vector3());
+        gltf.scene.position.sub(center);
+        if (m.position) wrapper.position.set(...m.position);
+        if (m.rotation) wrapper.rotation.set(...m.rotation);
+        if (m.scale) wrapper.scale.set(...m.scale);
+        scene.add(wrapper);
+      },
+      undefined,
+      (err) => console.error('[Web3DWidget] Modell konnte nicht geladen werden:', m.url, err),
+    );
+  });
 
   const { positionSpline, lookAtSpline } = buildSplines(config.keyframes, config.isLoop);
   let progress = 0;
 
-  if (config.mode === 'scroll') {
-    window.addEventListener('wheel', (e) => {
-      if (!positionSpline || !lookAtSpline) return;
-      progress += e.deltaY * 0.0005;
-      if (config.isLoop) {
-        progress = ((progress % 1) + 1) % 1;
-      } else {
-        progress = Math.max(0, Math.min(1, progress));
-      }
-      const pos = positionSpline.getPoint(progress);
-      const look = lookAtSpline.getPoint(progress);
-      camera.position.copy(pos);
-      camera.lookAt(look);
-    }, { passive: true });
+  // Fortschritt aus der Scroll-Position der (höheren) Eltern-Section ableiten.
+  function computeScrollProgress(): number {
+    const track = container?.parentElement;
+    if (!track) return 0;
+    const scrollable = track.offsetHeight - window.innerHeight;
+    if (scrollable <= 0) return 0;
+    const scrolled = -track.getBoundingClientRect().top;
+    return clamp01(scrolled / scrollable);
+  }
+
+  function applyCamera(t: number) {
+    if (!positionSpline || !lookAtSpline) return;
+    const pos = positionSpline.getPoint(t);
+    const look = lookAtSpline.getPoint(t);
+    camera.position.copy(pos);
+    camera.lookAt(look);
   }
 
   let lastTime = performance.now();
 
   function animate() {
     requestAnimationFrame(animate);
+    const now = performance.now();
+    const dt = (now - lastTime) / 1000;
+    lastTime = now;
 
-    if ((config.mode === 'autoplay' || config.mode === 'loop') && positionSpline && lookAtSpline) {
-      const now = performance.now();
-      const dt = (now - lastTime) / 1000;
-      lastTime = now;
-
-      const duration = Math.max(config.keyframes.length * 2, 1);
-      progress += (dt * config.speed) / duration;
-
-      if (progress >= 1) {
-        progress = config.mode === 'loop' || config.isLoop ? progress % 1 : 1;
+    if (positionSpline && lookAtSpline) {
+      if (config.mode === 'scroll') {
+        const target = computeScrollProgress();
+        progress += (target - progress) * 0.12;
+        applyCamera(progress);
+      } else {
+        const duration = Math.max(config.keyframes.length * 2, 1);
+        progress += (dt * config.speed) / duration;
+        if (progress >= 1) {
+          progress = config.mode === 'loop' || config.isLoop ? progress % 1 : 1;
+        }
+        applyCamera(progress);
       }
-
-      const pos = positionSpline.getPoint(progress);
-      const look = lookAtSpline.getPoint(progress);
-      camera.position.copy(pos);
-      camera.lookAt(look);
     }
 
     renderer.render(scene, camera);
@@ -122,7 +155,7 @@ function init(selector: string, config: WidgetConfig) {
     camera.updateProjectionMatrix();
     renderer.setSize(container.clientWidth, container.clientHeight);
   });
-  ro.observe(container as Element);
+  ro.observe(container);
 }
 
 (globalThis as Record<string, unknown>).Web3DWidget = { init };
