@@ -15,6 +15,17 @@ export type ModelEntry = {
   rotation: [number, number, number];
   scale: [number, number, number];
   createdAt: number;
+  /** Display order in the scene outliner (ascending). Older records may lack it. */
+  order?: number;
+  /** Id of the containing outliner group, or null/undefined when ungrouped. */
+  groupId?: string | null;
+};
+
+export type SceneGroup = {
+  id: string;
+  name: string;
+  collapsed: boolean;
+  order: number;
 };
 
 export type KeyframeData = {
@@ -36,6 +47,8 @@ export type Project = {
   cameraPath: CameraPath;
   createdAt: number;
   updatedAt: number;
+  /** Scene outliner groups (flat, single level). Older projects may lack it. */
+  groups?: SceneGroup[];
 };
 
 interface Web3DStudioDB extends DBSchema {

@@ -8,6 +8,7 @@ export function useModels(projectId: string) {
   const load = useCallback(async () => {
     const db = await getDB();
     const all = await db.getAllFromIndex('models', 'by-project', projectId);
+    all.sort((a, b) => (a.order ?? a.createdAt) - (b.order ?? b.createdAt));
     setModels(all);
     setLoading(false);
   }, [projectId]);
@@ -22,6 +23,7 @@ export function useModels(projectId: string) {
       const id = generateId();
       const buffer = await file.arrayBuffer();
 
+      const now = Date.now();
       const entry: ModelEntry = {
         id,
         projectId,
@@ -31,7 +33,9 @@ export function useModels(projectId: string) {
         position: [0, 0, 0],
         rotation: [0, 0, 0],
         scale: [1, 1, 1],
-        createdAt: Date.now(),
+        createdAt: now,
+        order: now,
+        groupId: null,
       };
 
       const tx = db.transaction(['models', 'blobs'], 'readwrite');
@@ -74,5 +78,25 @@ export function useModels(projectId: string) {
     return blob?.data ?? null;
   }, []);
 
-  return { models, loading, addModel, updateModel, deleteModel, getModelBlob };
+  /**
+   * Persists a new ordering and (optional) group assignment for the given models
+   * in a single transaction, then reloads once. `updates` maps a model id to its
+   * new order index and target group.
+   */
+  const reorderModels = useCallback(
+    async (updates: { id: string; order: number; groupId: string | null }[]) => {
+      const db = await getDB();
+      const tx = db.transaction('models', 'readwrite');
+      const store = tx.objectStore('models');
+      for (const { id, order, groupId } of updates) {
+        const existing = await store.get(id);
+        if (existing) await store.put({ ...existing, order, groupId });
+      }
+      await tx.done;
+      await load();
+    },
+    [load],
+  );
+
+  return { models, loading, addModel, updateModel, deleteModel, getModelBlob, reorderModels };
 }

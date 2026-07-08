@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import * as THREE from 'three';
-import { getDB, type Project, type ModelEntry } from '@/lib/db';
+import { getDB, generateId, type Project, type ModelEntry, type SceneGroup } from '@/lib/db';
 import { useModels } from '@/hooks/useModels';
 import { useHistory, type Command } from '@/hooks/useHistory';
 import {
@@ -51,12 +51,13 @@ export function EditorPage() {
   const [outlinerCollapsed, setOutlinerCollapsed] = useState(false);
   const [visibilityMap, setVisibilityMap] = useState<Record<string, boolean>>({});
   const [showLeaveDialog, setShowLeaveDialog] = useState(false);
+  const [groups, setGroups] = useState<SceneGroup[]>([]);
 
   const clipboardRef = useRef<{ model: ModelEntry; blobId: string } | null>(null);
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const history = useHistory();
-  const { models, addModel, updateModel, deleteModel, getModelBlob } = useModels(id ?? '');
+  const { models, addModel, updateModel, deleteModel, getModelBlob, reorderModels } = useModels(id ?? '');
 
   // Load project
   useEffect(() => {
@@ -69,6 +70,7 @@ export function EditorPage() {
       setKeyframes(p.cameraPath.keyframes);
       setIsLoop(p.cameraPath.isLoop);
       setCameraSpeed(p.cameraPath.speed);
+      setGroups(p.groups ?? []);
     })();
   }, [id, navigate]);
 
@@ -126,16 +128,17 @@ export function EditorPage() {
       }
     }
 
-    // Save camera path
+    // Save camera path + outliner groups
     await db.put('projects', {
       ...project,
       cameraPath: { keyframes, isLoop, speed: cameraSpeed },
+      groups,
       updatedAt: Date.now(),
     });
 
     setSaveStatus('saved');
     setIsDirty(false);
-  }, [id, project, keyframes, isLoop, cameraSpeed, updateModel]);
+  }, [id, project, keyframes, isLoop, cameraSpeed, groups, updateModel]);
 
   // Handle back navigation
   const handleBack = useCallback(() => {
@@ -354,6 +357,57 @@ export function EditorPage() {
     [deleteModel, selectedId, markDirty],
   );
 
+  const handleCreateGroup = useCallback(() => {
+    setGroups((prev) => [
+      ...prev,
+      { id: generateId(), name: 'Neue Gruppe', collapsed: false, order: prev.length },
+    ]);
+    markDirty();
+  }, [markDirty]);
+
+  const handleRenameGroup = useCallback(
+    (groupId: string, name: string) => {
+      setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, name } : g)));
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const handleToggleGroupCollapsed = useCallback(
+    (groupId: string) => {
+      setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, collapsed: !g.collapsed } : g)));
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const handleDeleteGroup = useCallback(
+    (groupId: string) => {
+      const remaining = groups.filter((g) => g.id !== groupId).sort((a, b) => a.order - b.order);
+      const flat: { id: string; order: number; groupId: string | null }[] = [];
+      for (const g of remaining) {
+        for (const m of models.filter((m) => m.groupId === g.id)) {
+          flat.push({ id: m.id, order: flat.length, groupId: g.id });
+        }
+      }
+      for (const m of models.filter((m) => !m.groupId || m.groupId === groupId)) {
+        flat.push({ id: m.id, order: flat.length, groupId: null });
+      }
+      reorderModels(flat);
+      setGroups(remaining.map((g, i) => ({ ...g, order: i })));
+      markDirty();
+    },
+    [groups, models, reorderModels, markDirty],
+  );
+
+  const handleReorder = useCallback(
+    (items: { id: string; groupId: string | null }[]) => {
+      reorderModels(items.map((it, i) => ({ id: it.id, order: i, groupId: it.groupId })));
+      markDirty();
+    },
+    [reorderModels, markDirty],
+  );
+
   const handleTransformModeChange = useCallback((mode: TransformMode) => {
     setTransformModeState(mode);
     const ctx = viewportRef.current;
@@ -433,7 +487,10 @@ export function EditorPage() {
         onTransformModeChange={handleTransformModeChange}
         onAddModel={() => setShowUploadDialog(true)}
         onOpenKeyframeEditor={() => setShowKeyframeEditor(!showKeyframeEditor)}
-        onExport={() => setShowExportDialog(true)}
+        onExport={async () => {
+          await performSave();
+          setShowExportDialog(true);
+        }}
         onBack={handleBack}
         onUndo={history.undo}
         onRedo={history.redo}
@@ -444,6 +501,7 @@ export function EditorPage() {
       />
       <SceneOutliner
         models={models}
+        groups={groups}
         selectedId={selectedId}
         visibilityMap={visibilityMap}
         onSelect={handleOutlinerSelect}
@@ -451,6 +509,11 @@ export function EditorPage() {
         onRename={handleOutlinerRename}
         onDuplicate={handleOutlinerDuplicate}
         onDelete={handleOutlinerDelete}
+        onCreateGroup={handleCreateGroup}
+        onRenameGroup={handleRenameGroup}
+        onDeleteGroup={handleDeleteGroup}
+        onToggleGroupCollapsed={handleToggleGroupCollapsed}
+        onReorder={handleReorder}
         collapsed={outlinerCollapsed}
         onToggleCollapse={() => setOutlinerCollapsed(!outlinerCollapsed)}
       />
@@ -471,7 +534,11 @@ export function EditorPage() {
         />
       )}
       <ModelUploadDialog open={showUploadDialog} onOpenChange={setShowUploadDialog} onUpload={handleUpload} />
-      <ExportDialog open={showExportDialog} onOpenChange={setShowExportDialog} project={project} />
+      <ExportDialog
+        open={showExportDialog}
+        onOpenChange={setShowExportDialog}
+        project={{ ...project, cameraPath: { keyframes, isLoop, speed: cameraSpeed } }}
+      />
 
       <AlertDialog open={showLeaveDialog} onOpenChange={setShowLeaveDialog}>
         <AlertDialogContent>
