@@ -62,6 +62,7 @@ async function githubErrorMessage(res: Response): Promise<string> {
 /**
  * Creates or updates a single file in a GitHub repo via the Contents API.
  * Fetches the existing blob sha first so updates don't fail with 409/422.
+ * Returns the resulting commit SHA so callers can pin immutable CDN URLs.
  */
 async function putFileToGitHub(params: {
   owner: string;
@@ -71,7 +72,7 @@ async function putFileToGitHub(params: {
   data: ArrayBuffer;
   token: string;
   message: string;
-}): Promise<void> {
+}): Promise<string | undefined> {
   const { owner, repo, branch, path, data, token, message } = params;
   const encodedPath = path
     .split('/')
@@ -101,6 +102,8 @@ async function putFileToGitHub(params: {
   if (!putRes.ok) {
     throw new Error(`PUT ${path}: ${putRes.status} – ${await githubErrorMessage(putRes)}`);
   }
+  const putJson = (await putRes.json()) as { commit?: { sha?: string } };
+  return putJson.commit?.sha;
 }
 
 export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps) {
@@ -119,6 +122,9 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
   const [uploading, setUploading] = useState(false);
   const [uploadLog, setUploadLog] = useState<string[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  // Commit SHA of the most recent GitHub upload. When set, embed URLs are pinned
+  // to it (immutable → jsDelivr serves fresh content without cache purge).
+  const [deployedSha, setDeployedSha] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open || !project) return;
@@ -129,10 +135,20 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
     })();
   }, [open, project]);
 
+  // Any change to the repo target or project invalidates a previously pinned
+  // commit, so fall back to the branch until the user re-uploads.
+  useEffect(() => {
+    setDeployedSha(null);
+  }, [owner, repo, branch, open, project]);
+
   const projectSlug = project ? slugify(project.name) : '';
-  const baseUrl = `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${branch}`;
-  const rawBaseUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}`;
-  const scriptUrl = `${baseUrl}/dist-widget/web3d-widget.iife.js?v=2`;
+  // Pin to the uploaded commit when available; otherwise track the branch.
+  const ref = deployedSha ?? branch;
+  const baseUrl = `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}`;
+  const rawBaseUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${ref}`;
+  // A commit-pinned script URL is immutable, so the cache-busting query is only
+  // needed for the mutable @branch fallback.
+  const scriptUrl = `${baseUrl}/dist-widget/web3d-widget.iife.js${deployedSha ? '' : '?v=2'}`;
   const modelFileName = (m: ModelEntry) => `${m.id}.${fileExtension(m.fileName)}`;
   // jsDelivr refuses GitHub files larger than 20 MiB (HTTP 403). Fall back to
   // raw.githubusercontent.com (CORS-enabled, 100 MB limit) for oversized assets.
@@ -310,20 +326,24 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
     setUploadLog([]);
     try {
       const db = await getDB();
+      // Track the newest commit; the last upload's commit contains every prior
+      // file plus the widget bundle, so pinning to it serves a consistent set.
+      let lastSha: string | undefined;
 
       for (const m of models) {
         const blob = await db.get('blobs', m.id);
         if (!blob) continue;
         const path = `dist-widget/models/${projectSlug}/${modelFileName(m)}`;
-        await putFileToGitHub({
-          owner,
-          repo,
-          branch,
-          path,
-          data: blob.data,
-          token,
-          message: `Upload widget model ${modelFileName(m)}`,
-        });
+        lastSha =
+          (await putFileToGitHub({
+            owner,
+            repo,
+            branch,
+            path,
+            data: blob.data,
+            token,
+            message: `Upload widget model ${modelFileName(m)}`,
+          })) ?? lastSha;
         log.push(`OK  ${path}`);
         setUploadLog([...log]);
       }
@@ -332,15 +352,16 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
         const blob = await db.get('blobs', environment.blobId);
         if (blob) {
           const path = `dist-widget/env/${projectSlug}/${envFileName}`;
-          await putFileToGitHub({
-            owner,
-            repo,
-            branch,
-            path,
-            data: blob.data,
-            token,
-            message: `Upload widget environment ${envFileName}`,
-          });
+          lastSha =
+            (await putFileToGitHub({
+              owner,
+              repo,
+              branch,
+              path,
+              data: blob.data,
+              token,
+              message: `Upload widget environment ${envFileName}`,
+            })) ?? lastSha;
           log.push(`OK  ${path}`);
           setUploadLog([...log]);
         }
@@ -348,8 +369,14 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
 
       if (!log.length) {
         log.push('Nichts hochzuladen – kein Modell und keine Umgebung vorhanden.');
+      } else if (lastSha) {
+        setDeployedSha(lastSha);
+        log.push(
+          `Fertig. Embed-URLs auf Commit ${lastSha.slice(0, 7)} gepinnt – sofort live, kein Cache-Delay.`,
+        );
+        log.push('Wichtig: Embed-Code unten neu kopieren, damit der Pin greift.');
       } else {
-        log.push('Fertig. jsDelivr cacht bis zu 12h – ggf. Version im Script-Query erhöhen.');
+        log.push('Fertig. jsDelivr cacht @main bis zu 12h – ggf. erneut einbetten.');
       }
       setUploadLog([...log]);
     } catch (err) {
@@ -419,6 +446,12 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
               Script wird geladen von{' '}
               <code className="break-all text-foreground">{scriptUrl}</code>
             </p>
+            {deployedSha && (
+              <p className="text-xs text-green-400">
+                Auf Commit <code className="text-foreground">{deployedSha.slice(0, 7)}</code> gepinnt –
+                unveränderliche URLs, kein jsDelivr-Cache-Problem.
+              </p>
+            )}
             <div className="flex items-start gap-2 rounded-md border border-orange-500/40 bg-orange-500/10 p-3 text-xs text-orange-300">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
               <span>
