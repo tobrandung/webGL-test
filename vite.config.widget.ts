@@ -10,6 +10,9 @@ export default defineConfig({
       formats: ['iife'],
     },
     outDir: 'dist-widget',
+    // Keep hosted assets (models/, env/) that live alongside the bundle in this
+    // directory — Vite would otherwise wipe them on every widget build.
+    emptyOutDir: false,
     rollupOptions: {
       output: {
         inlineDynamicImports: true,
