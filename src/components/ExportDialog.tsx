@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { Copy, Check, Download, AlertTriangle, FolderDown } from 'lucide-react';
+import { Copy, Check, Download, AlertTriangle, FolderDown, Upload, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -39,6 +39,70 @@ function fileExtension(fileName: string): string {
   return idx >= 0 ? fileName.slice(idx + 1).toLowerCase() : 'glb';
 }
 
+/** Encodes an ArrayBuffer to base64 in chunks to avoid call-stack limits. */
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+async function githubErrorMessage(res: Response): Promise<string> {
+  try {
+    const json = (await res.json()) as { message?: string };
+    return json.message ?? res.statusText;
+  } catch {
+    return res.statusText;
+  }
+}
+
+/**
+ * Creates or updates a single file in a GitHub repo via the Contents API.
+ * Fetches the existing blob sha first so updates don't fail with 409/422.
+ */
+async function putFileToGitHub(params: {
+  owner: string;
+  repo: string;
+  branch: string;
+  path: string;
+  data: ArrayBuffer;
+  token: string;
+  message: string;
+}): Promise<void> {
+  const { owner, repo, branch, path, data, token, message } = params;
+  const encodedPath = path
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+  const api = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
+  const headers: HeadersInit = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+
+  let sha: string | undefined;
+  const getRes = await fetch(`${api}?ref=${encodeURIComponent(branch)}`, { headers });
+  if (getRes.ok) {
+    const json = (await getRes.json()) as { sha?: string };
+    sha = json.sha;
+  } else if (getRes.status !== 404) {
+    throw new Error(`GET ${path}: ${getRes.status} – ${await githubErrorMessage(getRes)}`);
+  }
+
+  const putRes = await fetch(api, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({ message, content: arrayBufferToBase64(data), branch, sha }),
+  });
+  if (!putRes.ok) {
+    throw new Error(`PUT ${path}: ${putRes.status} – ${await githubErrorMessage(putRes)}`);
+  }
+}
+
 export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps) {
   const [exportMode, setExportMode] = useState<ExportMode>('scroll');
   const [transparent, setTransparent] = useState(false);
@@ -49,6 +113,12 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
   const [models, setModels] = useState<ModelEntry[]>([]);
   const [savingFolder, setSavingFolder] = useState(false);
   const [folderStatus, setFolderStatus] = useState<string | null>(null);
+  const [includeEnv, setIncludeEnv] = useState(true);
+  const [envFolderStatus, setEnvFolderStatus] = useState<string | null>(null);
+  const [token, setToken] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [uploadLog, setUploadLog] = useState<string[]>([]);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open || !project) return;
@@ -61,9 +131,20 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
 
   const projectSlug = project ? slugify(project.name) : '';
   const baseUrl = `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${branch}`;
+  const rawBaseUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}`;
   const scriptUrl = `${baseUrl}/dist-widget/web3d-widget.iife.js?v=2`;
   const modelFileName = (m: ModelEntry) => `${m.id}.${fileExtension(m.fileName)}`;
-  const modelPath = (m: ModelEntry) => `${baseUrl}/dist-widget/models/${projectSlug}/${modelFileName(m)}`;
+  // jsDelivr refuses GitHub files larger than 20 MiB (HTTP 403). Fall back to
+  // raw.githubusercontent.com (CORS-enabled, 100 MB limit) for oversized assets.
+  const JSDELIVR_MAX_BYTES = 20 * 1024 * 1024;
+  const assetUrl = (repoPath: string, sizeBytes: number) =>
+    sizeBytes > JSDELIVR_MAX_BYTES ? `${rawBaseUrl}/${repoPath}` : `${baseUrl}/${repoPath}`;
+  const modelPath = (m: ModelEntry) =>
+    assetUrl(`dist-widget/models/${projectSlug}/${modelFileName(m)}`, m.fileSize);
+  const environment = project?.environment ?? null;
+  const envFileName = environment ? `${environment.blobId}.${fileExtension(environment.fileName)}` : '';
+  const envPath = `${baseUrl}/dist-widget/env/${projectSlug}/${envFileName}`;
+  const oversizedModels = models.filter((m) => m.fileSize > JSDELIVR_MAX_BYTES);
 
   const getEmbedCode = useCallback(() => {
     if (!project) return '';
@@ -88,6 +169,20 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
     // Rückwärtskompatibel: ältere Widget-Builds auf jsDelivr lesen nur modelUrl.
     if (mappedModels.length === 1) {
       config.modelUrl = mappedModels[0].url;
+    }
+
+    if (project.lights && project.lights.length) {
+      config.lights = project.lights;
+    }
+
+    if (environment && includeEnv) {
+      config.environment = {
+        url: envPath,
+        showBackground: environment.showBackground,
+        useForReflection: environment.useForReflection,
+        intensity: environment.intensity,
+        blurriness: environment.blurriness,
+      };
     }
 
     const configStr = JSON.stringify(config);
@@ -125,7 +220,7 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
   document.head.appendChild(s);
 })();
 <\/script>`;
-  }, [project, exportMode, transparent, models, scriptUrl, baseUrl]);
+  }, [project, exportMode, transparent, models, scriptUrl, baseUrl, environment, includeEnv, envPath]);
 
   const handleCopy = useCallback(async () => {
     await navigator.clipboard.writeText(getEmbedCode());
@@ -173,9 +268,101 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
     }
   }, [project, models, projectSlug]);
 
+  const downloadEnv = useCallback(async () => {
+    if (!environment) return;
+    const db = await getDB();
+    const blob = await db.get('blobs', environment.blobId);
+    if (!blob) return;
+    const url = URL.createObjectURL(new Blob([blob.data]));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = envFileName;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [environment, envFileName]);
+
+  const saveEnvToFolder = useCallback(async () => {
+    if (!project || !environment) return;
+    setEnvFolderStatus(null);
+    try {
+      const picker = (window as unknown as { showDirectoryPicker: DirectoryPicker }).showDirectoryPicker;
+      const root = await picker({ mode: 'readwrite' });
+      const projectDir = await root.getDirectoryHandle(projectSlug, { create: true });
+      const db = await getDB();
+      const blob = await db.get('blobs', environment.blobId);
+      if (!blob) return;
+      const handle = await projectDir.getFileHandle(envFileName, { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(new Blob([blob.data]));
+      await writable.close();
+      setEnvFolderStatus(`Umgebung in „${projectSlug}/" gespeichert.`);
+    } catch (err) {
+      if ((err as DOMException)?.name === 'AbortError') return;
+      setEnvFolderStatus('Speichern fehlgeschlagen – nutze stattdessen den Download.');
+    }
+  }, [project, environment, projectSlug, envFileName]);
+
+  const uploadToGitHub = useCallback(async () => {
+    if (!project || !token || !owner || !repo) return;
+    setUploading(true);
+    setUploadError(null);
+    const log: string[] = [];
+    setUploadLog([]);
+    try {
+      const db = await getDB();
+
+      for (const m of models) {
+        const blob = await db.get('blobs', m.id);
+        if (!blob) continue;
+        const path = `dist-widget/models/${projectSlug}/${modelFileName(m)}`;
+        await putFileToGitHub({
+          owner,
+          repo,
+          branch,
+          path,
+          data: blob.data,
+          token,
+          message: `Upload widget model ${modelFileName(m)}`,
+        });
+        log.push(`OK  ${path}`);
+        setUploadLog([...log]);
+      }
+
+      if (environment && includeEnv) {
+        const blob = await db.get('blobs', environment.blobId);
+        if (blob) {
+          const path = `dist-widget/env/${projectSlug}/${envFileName}`;
+          await putFileToGitHub({
+            owner,
+            repo,
+            branch,
+            path,
+            data: blob.data,
+            token,
+            message: `Upload widget environment ${envFileName}`,
+          });
+          log.push(`OK  ${path}`);
+          setUploadLog([...log]);
+        }
+      }
+
+      if (!log.length) {
+        log.push('Nichts hochzuladen – kein Modell und keine Umgebung vorhanden.');
+      } else {
+        log.push('Fertig. jsDelivr cacht bis zu 12h – ggf. Version im Script-Query erhöhen.');
+      }
+      setUploadLog([...log]);
+    } catch (err) {
+      setUploadError((err as Error).message);
+    } finally {
+      setUploading(false);
+    }
+  }, [project, token, owner, repo, branch, models, environment, includeEnv, projectSlug, envFileName]);
+
   if (!project) return null;
 
   const hasEnoughKeyframes = project.cameraPath.keyframes.length >= 2;
+  const canUpload = Boolean(token && owner && repo) && (models.length > 0 || (environment && includeEnv));
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -242,6 +429,58 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
             </div>
           </div>
 
+          <Separator />
+
+          <div className="space-y-2">
+            <Label htmlFor="gh-token">Direkt nach GitHub hochladen</Label>
+            <Input
+              id="gh-token"
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="GitHub Personal Access Token"
+              autoComplete="off"
+            />
+            <p className="text-xs text-muted-foreground">
+              Token mit Schreibrecht auf <code className="text-foreground">Contents</code> (Fine-grained:
+              „Contents: Read and write" für{' '}
+              <code className="text-foreground">
+                {owner}/{repo}
+              </code>
+              , oder Classic-Token mit <code className="text-foreground">repo</code>-Scope). Der Token wird
+              nur im Browser verwendet und nirgends gespeichert.
+            </p>
+
+            <Button
+              variant="default"
+              size="sm"
+              className="w-full"
+              disabled={!canUpload || uploading}
+              onClick={uploadToGitHub}
+            >
+              {uploading ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Upload className="mr-2 h-4 w-4" />
+              )}
+              {uploading
+                ? 'Lade hoch…'
+                : `Nach ${owner}/${repo} hochladen (Modelle${environment && includeEnv ? ' + HDRI' : ''})`}
+            </Button>
+
+            {uploadLog.length > 0 && (
+              <pre className="max-h-32 overflow-auto rounded-md bg-secondary p-2 text-[11px] text-green-400">
+                {uploadLog.join('\n')}
+              </pre>
+            )}
+            {uploadError && (
+              <div className="flex items-start gap-2 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-xs text-red-300">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>Upload fehlgeschlagen: {uploadError}</span>
+              </div>
+            )}
+          </div>
+
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <Label>Modelle</Label>
@@ -297,7 +536,60 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
               <code className="break-all text-foreground">dist-widget/models/{projectSlug}/</code>{' '}
               ablegen. Danach committen &amp; pushen – jsDelivr liefert die Dateien aus.
             </p>
+
+            {oversizedModels.length > 0 && (
+              <div className="flex items-start gap-2 rounded-md border border-orange-500/40 bg-orange-500/10 p-3 text-xs text-orange-300">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>
+                  {oversizedModels.length === 1 ? 'Ein Modell ist' : `${oversizedModels.length} Modelle sind`}{' '}
+                  größer als 20&nbsp;MiB und werden von jsDelivr mit 403 abgelehnt. Der Embed-Code lädt
+                  diese daher über <code className="text-foreground">raw.githubusercontent.com</code>{' '}
+                  (funktioniert, ist aber kein CDN). Für schnelleres Laden das GLB komprimieren (Draco /
+                  Texturen), damit es unter 20&nbsp;MiB kommt.
+                </span>
+              </div>
+            )}
           </div>
+
+          {environment && (
+            <>
+              <Separator />
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="export-include-env">HDRI / Umgebung einbeziehen</Label>
+                  <Switch id="export-include-env" checked={includeEnv} onCheckedChange={setIncludeEnv} />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {environment.showBackground
+                    ? 'Wird als Hintergrund und Spiegelung eingebettet.'
+                    : 'Transparenter Hintergrund, Spiegelung im Modell bleibt erhalten.'}
+                </p>
+
+                {includeEnv && (
+                  <>
+                    <div className="flex items-center gap-2 rounded-md bg-secondary px-3 py-2">
+                      <span className="min-w-0 flex-1 truncate text-xs">{environment.fileName}</span>
+                      <Button variant="ghost" size="sm" className="shrink-0" onClick={downloadEnv}>
+                        <Download className="mr-1 h-3.5 w-3.5" />
+                        {envFileName}
+                      </Button>
+                    </div>
+                    {supportsFsAccess && (
+                      <Button variant="default" size="sm" className="w-full" onClick={saveEnvToFolder}>
+                        <FolderDown className="mr-2 h-4 w-4" />
+                        Umgebung in Ordner speichern
+                      </Button>
+                    )}
+                    {envFolderStatus && <p className="text-xs text-green-400">{envFolderStatus}</p>}
+                    <p className="text-xs text-muted-foreground">
+                      Datei im Repo unter{' '}
+                      <code className="break-all text-foreground">dist-widget/env/{projectSlug}/</code> ablegen.
+                    </p>
+                  </>
+                )}
+              </div>
+            </>
+          )}
 
           <Separator />
 

@@ -7,6 +7,14 @@ import { ArrowLeft, Play, Pause } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { getDB, type Project } from '@/lib/db';
 import { buildSplines, getCameraAtProgress, type Keyframe } from '@/three/camera-path';
+import {
+  syncLights,
+  applyEnvironment,
+  loadEquirectTexture,
+  createDefaultLights,
+  type LightRecord,
+  type EnvironmentState,
+} from '@/three/lighting';
 
 type PreviewMode = 'scroll' | 'autoplay';
 
@@ -59,20 +67,35 @@ export function PreviewPage() {
     const renderer = new THREE.WebGLRenderer({ canvas: canvasRef.current, antialias: true, alpha: project.settings.transparent });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(canvasRef.current.clientWidth, canvasRef.current.clientHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.2;
     rendererRef.current = renderer;
 
-    const ambient = new THREE.AmbientLight(0xffffff, 0.4);
-    scene.add(ambient);
-    const key = new THREE.DirectionalLight(0xffffff, 1.2);
-    key.position.set(5, 8, 5);
-    scene.add(key);
-    const fill = new THREE.DirectionalLight(0xb4c6e0, 0.6);
-    fill.position.set(-3, 4, -2);
-    scene.add(fill);
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x1a1a1a, 0.3);
-    scene.add(hemi);
+    const lightStore = new Map<string, LightRecord>();
+    syncLights(scene, project.lights && project.lights.length ? project.lights : createDefaultLights(), lightStore);
+
+    let envState: EnvironmentState | null = null;
+    let envCancelled = false;
+    if (project.environment) {
+      const env = project.environment;
+      (async () => {
+        const db = await getDB();
+        const blob = await db.get('blobs', env.blobId);
+        if (!blob || envCancelled) return;
+        const texture = await loadEquirectTexture(new Blob([blob.data]), env.fileName);
+        if (envCancelled) {
+          texture.dispose();
+          return;
+        }
+        envState = applyEnvironment(scene, renderer, texture, {
+          showBackground: env.showBackground,
+          useForReflection: env.useForReflection,
+          intensity: env.intensity,
+          blurriness: env.blurriness,
+        });
+      })();
+    }
 
     (async () => {
       const db = await getDB();
@@ -119,6 +142,9 @@ export function PreviewPage() {
     return () => {
       cancelAnimationFrame(animId);
       resizeObserver.disconnect();
+      envCancelled = true;
+      if (envState?.envMap) envState.envMap.dispose();
+      if (envState?.backgroundTexture) envState.backgroundTexture.dispose();
       renderer.dispose();
     };
   }, [project, id]);

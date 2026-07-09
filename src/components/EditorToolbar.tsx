@@ -1,4 +1,20 @@
-import { ArrowLeft, Plus, Move, RotateCw, Maximize, Video, Undo2, Redo2, Share } from 'lucide-react';
+import {
+  ArrowLeft,
+  Plus,
+  Move,
+  RotateCw,
+  Maximize,
+  Video,
+  Undo2,
+  Redo2,
+  Share,
+  Box,
+  Lightbulb,
+  Sun,
+  Flashlight,
+  Globe,
+  Image,
+} from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
@@ -7,13 +23,27 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import type { TransformMode } from '@/three/viewport';
+import type { LightType } from '@/lib/db';
 import type { HistoryState } from '@/hooks/useHistory';
 
 type EditorToolbarProps = {
   transformMode: TransformMode;
   onTransformModeChange: (mode: TransformMode) => void;
   onAddModel: () => void;
+  onAddLight: (type: LightType) => void;
+  onAddEnvironment: () => void;
   onOpenKeyframeEditor: () => void;
   onExport: () => void;
   onBack: () => void;
@@ -29,6 +59,8 @@ export function EditorToolbar({
   transformMode,
   onTransformModeChange,
   onAddModel,
+  onAddLight,
+  onAddEnvironment,
   onOpenKeyframeEditor,
   onExport,
   onBack,
@@ -127,15 +159,50 @@ export function EditorToolbar({
 
       <Separator orientation="vertical" className="mx-1.5 h-6" />
 
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button variant="ghost" size="sm" onClick={onAddModel}>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button variant="ghost" size="sm" aria-label="Objekt hinzufügen">
             <Plus className="mr-1 h-4 w-4" />
-            Modell
+            Hinzufügen
           </Button>
-        </TooltipTrigger>
-        <TooltipContent>Modell hinzufügen</TooltipContent>
-      </Tooltip>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start">
+          <DropdownMenuItem onClick={onAddModel}>
+            <Box className="mr-2 h-4 w-4" />
+            Modell
+          </DropdownMenuItem>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <Lightbulb className="mr-2 h-4 w-4" />
+              Licht
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              <DropdownMenuItem onClick={() => onAddLight('point')}>
+                <Lightbulb className="mr-2 h-4 w-4" />
+                Punktlicht
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => onAddLight('directional')}>
+                <Sun className="mr-2 h-4 w-4" />
+                Richtungslicht
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => onAddLight('spot')}>
+                <Flashlight className="mr-2 h-4 w-4" />
+                Spotlicht
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => onAddLight('ambient')}>
+                <Globe className="mr-2 h-4 w-4" />
+                Umgebungslicht
+              </DropdownMenuItem>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-xs text-muted-foreground">Umgebung</DropdownMenuLabel>
+          <DropdownMenuItem onClick={onAddEnvironment}>
+            <Image className="mr-2 h-4 w-4" />
+            HDRI / Umgebung
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
 
       <div className="flex-1" />
 

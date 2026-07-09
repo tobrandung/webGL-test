@@ -1,8 +1,49 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 
+export type Vec3 = [number, number, number];
+
 export type ProjectSettings = {
   background: string;
   transparent: boolean;
+};
+
+export type LightType = 'ambient' | 'directional' | 'point' | 'spot';
+
+export type LightEntry = {
+  id: string;
+  name: string;
+  type: LightType;
+  /** Hex color string, e.g. "#ffffff". */
+  color: string;
+  intensity: number;
+  /** World position. Ignored for ambient lights. */
+  position: Vec3;
+  /** Aim point for directional/spot lights. */
+  target?: Vec3;
+  /** Range for point/spot lights (0 = infinite). */
+  distance?: number;
+  /** Physical falloff for point/spot lights. */
+  decay?: number;
+  /** Cone angle in radians for spot lights. */
+  angle?: number;
+  /** Soft cone edge (0-1) for spot lights. */
+  penumbra?: number;
+  visible?: boolean;
+  order?: number;
+};
+
+export type EnvironmentConfig = {
+  /** Key into the `blobs` store holding the equirectangular image. */
+  blobId: string;
+  fileName: string;
+  /** Render the image as the visible scene background (dome). */
+  showBackground: boolean;
+  /** Use the image as IBL reflection source (scene.environment). */
+  useForReflection: boolean;
+  /** Global environment/background intensity. */
+  intensity: number;
+  /** Optional background blur (0-1) when shown as background. */
+  blurriness?: number;
 };
 
 export type ModelEntry = {
@@ -49,6 +90,10 @@ export type Project = {
   updatedAt: number;
   /** Scene outliner groups (flat, single level). Older projects may lack it. */
   groups?: SceneGroup[];
+  /** Placed light sources. Older projects lack it and get seeded defaults. */
+  lights?: LightEntry[];
+  /** Optional single equirectangular environment for reflections/background. */
+  environment?: EnvironmentConfig | null;
 };
 
 interface Web3DStudioDB extends DBSchema {

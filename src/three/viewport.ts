@@ -7,6 +7,17 @@ import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { ColladaLoader } from 'three/addons/loaders/ColladaLoader.js';
+import {
+  syncLights,
+  applyEnvironment,
+  EMPTY_ENVIRONMENT,
+  type LightRecord,
+  type EnvironmentState,
+  type EnvironmentOptions,
+} from './lighting';
+import type { LightEntry } from '@/lib/db';
+
+export type SelectionKind = 'model' | 'light';
 
 export type ViewportContext = {
   scene: THREE.Scene;
@@ -15,7 +26,11 @@ export type ViewportContext = {
   orbitControls: OrbitControls;
   transformControls: TransformControls;
   models: Map<string, THREE.Group>;
+  lights: Map<string, LightRecord>;
+  environmentState: EnvironmentState;
   selectedModelId: string | null;
+  selectedId: string | null;
+  selectedKind: SelectionKind | null;
   dispose: () => void;
 };
 
@@ -47,10 +62,9 @@ export function createViewport(
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: transparent });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(canvas.clientWidth, canvas.clientHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.2;
-
-  setupLighting(scene);
 
   const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x222222);
   scene.add(gridHelper);
@@ -66,6 +80,7 @@ export function createViewport(
   scene.add(transformControls.getHelper());
 
   const models = new Map<string, THREE.Group>();
+  const lights = new Map<string, LightRecord>();
   let animationId = 0;
   let disposed = false;
 
@@ -95,7 +110,11 @@ export function createViewport(
     orbitControls,
     transformControls,
     models,
+    lights,
+    environmentState: EMPTY_ENVIRONMENT,
     selectedModelId: null,
+    selectedId: null,
+    selectedKind: null,
     dispose() {
       disposed = true;
       cancelAnimationFrame(animationId);
@@ -107,25 +126,38 @@ export function createViewport(
   };
 }
 
-function setupLighting(scene: THREE.Scene) {
-  const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
-  scene.add(ambientLight);
+/** Reconciles the editor scene lights with the given entries (with helpers). */
+export function applyViewportLights(ctx: ViewportContext, entries: LightEntry[]) {
+  syncLights(ctx.scene, entries, ctx.lights, { helpers: true });
+}
 
-  const keyLight = new THREE.DirectionalLight(0xffffff, 1.2);
-  keyLight.position.set(5, 8, 5);
-  keyLight.castShadow = true;
-  scene.add(keyLight);
+/** Applies (or clears) the equirect environment for the editor viewport. */
+export function setViewportEnvironment(
+  ctx: ViewportContext,
+  texture: THREE.Texture | null,
+  options: EnvironmentOptions,
+) {
+  ctx.environmentState = applyEnvironment(ctx.scene, ctx.renderer, texture, options, ctx.environmentState);
+}
 
-  const fillLight = new THREE.DirectionalLight(0xb4c6e0, 0.6);
-  fillLight.position.set(-3, 4, -2);
-  scene.add(fillLight);
-
-  const rimLight = new THREE.DirectionalLight(0xffd4a0, 0.5);
-  rimLight.position.set(0, 3, -6);
-  scene.add(rimLight);
-
-  const hemiLight = new THREE.HemisphereLight(0xffffff, 0x1a1a1a, 0.3);
-  scene.add(hemiLight);
+/**
+ * Renders one fresh frame and returns a downscaled JPEG data URL for use as a
+ * project card thumbnail. The read must happen synchronously right after
+ * `render()` because the WebGL drawing buffer is not preserved between frames.
+ */
+export function captureThumbnail(ctx: ViewportContext, width = 320, height = 180): string {
+  ctx.renderer.render(ctx.scene, ctx.camera);
+  const source = ctx.renderer.domElement;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const c2d = canvas.getContext('2d');
+  if (!c2d) return '';
+  // Flatten onto a solid backdrop so transparent scenes don't become pure black.
+  c2d.fillStyle = '#0f0f11';
+  c2d.fillRect(0, 0, width, height);
+  c2d.drawImage(source, 0, 0, width, height);
+  return canvas.toDataURL('image/jpeg', 0.72);
 }
 
 export async function loadModelFromBuffer(
@@ -200,19 +232,40 @@ export async function loadModelFromBuffer(
   return wrapper;
 }
 
-export function selectModel(ctx: ViewportContext, id: string | null) {
-  ctx.selectedModelId = id;
-  if (!id) {
+/** Unified selection for models and lights; attaches the transform gizmo. */
+export function selectObject(ctx: ViewportContext, id: string | null, kind: SelectionKind | null) {
+  ctx.selectedId = id;
+  ctx.selectedKind = id ? kind : null;
+  ctx.selectedModelId = kind === 'model' ? id : null;
+
+  if (!id || !kind) {
     ctx.transformControls.detach();
     return;
   }
-  const model = ctx.models.get(id);
-  if (model) {
-    ctx.transformControls.attach(model);
+
+  if (kind === 'model') {
+    const model = ctx.models.get(id);
+    if (model) ctx.transformControls.attach(model);
+    return;
+  }
+
+  const record = ctx.lights.get(id);
+  if (record && !(record.light instanceof THREE.AmbientLight)) {
+    // Lights only support translation; direction derives from position -> target.
+    ctx.transformControls.setMode('translate');
+    ctx.transformControls.attach(record.light);
+  } else {
+    ctx.transformControls.detach();
   }
 }
 
+export function selectModel(ctx: ViewportContext, id: string | null) {
+  selectObject(ctx, id, id ? 'model' : null);
+}
+
 export function setTransformMode(ctx: ViewportContext, mode: TransformMode) {
+  // Lights are translate-only; ignore rotate/scale while a light is selected.
+  if (ctx.selectedKind === 'light' && mode !== 'translate') return;
   ctx.transformControls.setMode(mode);
 }
 

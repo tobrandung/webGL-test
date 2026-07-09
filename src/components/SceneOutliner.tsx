@@ -12,6 +12,12 @@ import {
   FolderPlus,
   FolderMinus,
   GripVertical,
+  Lightbulb,
+  Sun,
+  Flashlight,
+  Globe,
+  Image as ImageIcon,
+  Palette,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -30,20 +36,40 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import type { ModelEntry, SceneGroup } from '@/lib/db';
+import type { ModelEntry, SceneGroup, LightEntry, EnvironmentConfig } from '@/lib/db';
 
 type ReorderItem = { id: string; groupId: string | null };
+
+export type OutlinerSelectionKind = 'model' | 'light' | 'environment' | 'world';
+
+const ENVIRONMENT_SELECTION_ID = '__environment__';
+export const WORLD_SELECTION_ID = '__world__';
+
+const lightIcon = {
+  ambient: Globe,
+  directional: Sun,
+  point: Lightbulb,
+  spot: Flashlight,
+} as const;
 
 type SceneOutlinerProps = {
   models: ModelEntry[];
   groups: SceneGroup[];
+  lights: LightEntry[];
+  environment: EnvironmentConfig | null;
+  background: string;
   selectedId: string | null;
+  selectedKind: OutlinerSelectionKind | null;
   visibilityMap: Record<string, boolean>;
-  onSelect: (id: string | null) => void;
+  onSelect: (id: string | null, kind?: OutlinerSelectionKind) => void;
   onToggleVisibility: (id: string) => void;
   onRename: (id: string, name: string) => void;
   onDuplicate: (id: string) => void;
   onDelete: (id: string) => void;
+  onToggleLightVisibility: (id: string) => void;
+  onRenameLight: (id: string, name: string) => void;
+  onDeleteLight: (id: string) => void;
+  onRemoveEnvironment: () => void;
   onCreateGroup: () => void;
   onRenameGroup: (id: string, name: string) => void;
   onDeleteGroup: (id: string) => void;
@@ -56,13 +82,21 @@ type SceneOutlinerProps = {
 export function SceneOutliner({
   models,
   groups,
+  lights,
+  environment,
+  background,
   selectedId,
+  selectedKind,
   visibilityMap,
   onSelect,
   onToggleVisibility,
   onRename,
   onDuplicate,
   onDelete,
+  onToggleLightVisibility,
+  onRenameLight,
+  onDeleteLight,
+  onRemoveEnvironment,
   onCreateGroup,
   onRenameGroup,
   onDeleteGroup,
@@ -73,6 +107,7 @@ export function SceneOutliner({
 }: SceneOutlinerProps) {
   const [renamingModelId, setRenamingModelId] = useState<string | null>(null);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
+  const [renamingLightId, setRenamingLightId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
@@ -105,6 +140,14 @@ export function SceneOutliner({
       setRenamingGroupId(null);
     },
     [renameValue, onRenameGroup],
+  );
+
+  const commitLightRename = useCallback(
+    (id: string) => {
+      if (renameValue.trim()) onRenameLight(id, renameValue.trim());
+      setRenamingLightId(null);
+    },
+    [renameValue, onRenameLight],
   );
 
   // Rebuilds the full ordered list after moving the dragged model into
@@ -151,7 +194,7 @@ export function SceneOutliner({
 
   const renderModelRow = (model: ModelEntry) => {
     const isVisible = visibilityMap[model.id] !== false;
-    const isSelected = selectedId === model.id;
+    const isSelected = selectedId === model.id && selectedKind === 'model';
     const isRenaming = renamingModelId === model.id;
     const isDropBefore = dropTarget === `model:${model.id}`;
 
@@ -179,10 +222,10 @@ export function SceneOutliner({
         } ${
           isSelected ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/50'
         } ${draggingId === model.id ? 'opacity-40' : ''}`}
-        onClick={() => onSelect(model.id)}
+        onClick={() => onSelect(model.id, 'model')}
         role="button"
         tabIndex={0}
-        onKeyDown={(e) => e.key === 'Enter' && onSelect(model.id)}
+        onKeyDown={(e) => e.key === 'Enter' && onSelect(model.id, 'model')}
       >
         <GripVertical className="h-3.5 w-3.5 shrink-0 cursor-grab text-muted-foreground opacity-0 group-hover:opacity-100" />
 
@@ -268,6 +311,167 @@ export function SceneOutliner({
     );
   };
 
+  const renderLightRow = (light: LightEntry) => {
+    const isVisible = light.visible !== false;
+    const isSelected = selectedId === light.id && selectedKind === 'light';
+    const isRenaming = renamingLightId === light.id;
+    const Icon = lightIcon[light.type];
+
+    return (
+      <div
+        key={light.id}
+        className={`group flex items-center gap-1 rounded-md px-2 py-1 ${
+          isSelected ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/50'
+        }`}
+        onClick={() => onSelect(light.id, 'light')}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => e.key === 'Enter' && onSelect(light.id, 'light')}
+      >
+        <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              className="shrink-0 text-muted-foreground hover:text-foreground"
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleLightVisibility(light.id);
+              }}
+              type="button"
+              aria-label={isVisible ? 'Ausblenden' : 'Einblenden'}
+            >
+              {isVisible ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5 opacity-50" />}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right">{isVisible ? 'Ausblenden' : 'Einblenden'}</TooltipContent>
+        </Tooltip>
+
+        {isRenaming ? (
+          <Input
+            className="h-6 flex-1 px-1 text-xs"
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onBlur={() => commitLightRename(light.id)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') commitLightRename(light.id);
+              if (e.key === 'Escape') setRenamingLightId(null);
+              e.stopPropagation();
+            }}
+            onClick={(e) => e.stopPropagation()}
+            autoFocus
+          />
+        ) : (
+          <span
+            className={`flex-1 truncate text-xs ${!isVisible ? 'opacity-50' : ''}`}
+            onDoubleClick={(e) => {
+              e.stopPropagation();
+              setRenameValue(light.name);
+              setRenamingLightId(light.id);
+            }}
+          >
+            {light.name}
+          </span>
+        )}
+
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              className="shrink-0 opacity-0 group-hover:opacity-100"
+              onClick={(e) => e.stopPropagation()}
+              type="button"
+              aria-label="Licht-Optionen"
+            >
+              <MoreHorizontal className="h-3.5 w-3.5 text-muted-foreground" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+            <DropdownMenuItem
+              onClick={() => {
+                setRenameValue(light.name);
+                setRenamingLightId(light.id);
+              }}
+            >
+              <Pencil className="mr-2 h-3.5 w-3.5" />
+              Umbenennen
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem className="text-red-400 focus:text-red-400" onClick={() => onDeleteLight(light.id)}>
+              <Trash2 className="mr-2 h-3.5 w-3.5" />
+              Löschen
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    );
+  };
+
+  const renderWorldRow = () => {
+    const isSelected = selectedKind === 'world';
+    return (
+      <div
+        className={`group flex items-center gap-1 rounded-md px-2 py-1 ${
+          isSelected ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/50'
+        }`}
+        onClick={() => onSelect(WORLD_SELECTION_ID, 'world')}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => e.key === 'Enter' && onSelect(WORLD_SELECTION_ID, 'world')}
+      >
+        <Palette className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        <span className="flex-1 truncate text-xs">Hintergrund</span>
+        <span
+          className="h-3.5 w-3.5 shrink-0 rounded-sm border border-border"
+          style={{ backgroundColor: background }}
+          aria-hidden
+        />
+      </div>
+    );
+  };
+
+  const renderEnvironmentRow = () => {
+    if (!environment) return null;
+    const isSelected = selectedKind === 'environment';
+    return (
+      <div
+        className={`group flex items-center gap-1 rounded-md px-2 py-1 ${
+          isSelected ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/50'
+        }`}
+        onClick={() => onSelect(ENVIRONMENT_SELECTION_ID, 'environment')}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => e.key === 'Enter' && onSelect(ENVIRONMENT_SELECTION_ID, 'environment')}
+      >
+        <ImageIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        <span className="flex-1 truncate text-xs">{environment.fileName}</span>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              className="shrink-0 opacity-0 group-hover:opacity-100"
+              onClick={(e) => e.stopPropagation()}
+              type="button"
+              aria-label="Umgebungs-Optionen"
+            >
+              <MoreHorizontal className="h-3.5 w-3.5 text-muted-foreground" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+            <DropdownMenuItem className="text-red-400 focus:text-red-400" onClick={() => onRemoveEnvironment()}>
+              <Trash2 className="mr-2 h-3.5 w-3.5" />
+              Entfernen
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    );
+  };
+
+  const sectionLabel = (text: string) => (
+    <p className="px-2 pt-2 pb-1 text-[10px] font-semibold tracking-wider text-muted-foreground uppercase">
+      {text}
+    </p>
+  );
+
   if (collapsed) {
     return (
       <div className="absolute left-0 top-[49px] z-10">
@@ -315,6 +519,25 @@ export function SceneOutliner({
       <Separator />
       <ScrollArea className="flex-1">
         <div className="p-1">
+          {sectionLabel('Welt')}
+          {renderWorldRow()}
+
+          {environment && (
+            <>
+              {sectionLabel('Umgebung')}
+              {renderEnvironmentRow()}
+            </>
+          )}
+
+          {lights.length > 0 && (
+            <>
+              {sectionLabel('Licht')}
+              {[...lights].sort((a, b) => (a.order ?? 0) - (b.order ?? 0)).map(renderLightRow)}
+            </>
+          )}
+
+          {sectionLabel('Modelle')}
+
           {models.length === 0 && groups.length === 0 ? (
             <p className="px-3 py-4 text-center text-xs text-muted-foreground">Noch keine Modelle vorhanden</p>
           ) : (

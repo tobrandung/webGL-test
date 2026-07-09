@@ -1,6 +1,14 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import {
+  syncLights,
+  applyEnvironment,
+  loadEquirectTexture,
+  createDefaultLights,
+  type LightRecord,
+} from '@/three/lighting';
+import type { LightEntry } from '@/lib/db';
 
 type Vec3 = [number, number, number];
 
@@ -9,6 +17,14 @@ type ModelConfig = {
   position?: Vec3;
   rotation?: Vec3;
   scale?: Vec3;
+};
+
+type EnvironmentWidgetConfig = {
+  url: string;
+  showBackground: boolean;
+  useForReflection: boolean;
+  intensity: number;
+  blurriness?: number;
 };
 
 type WidgetConfig = {
@@ -22,6 +38,10 @@ type WidgetConfig = {
   models?: ModelConfig[];
   /** Rückwärtskompatibel: einzelnes Modell. */
   modelUrl?: string;
+  /** Platzierte Lichtquellen (Fallback: Standard-Studio-Setup). */
+  lights?: LightEntry[];
+  /** Optionale equirektanguläre Umgebung für Spiegelung/Hintergrund. */
+  environment?: EnvironmentWidgetConfig;
 };
 
 function buildSplines(keyframes: WidgetConfig['keyframes'], isLoop: boolean) {
@@ -61,20 +81,27 @@ function init(selector: string, config: WidgetConfig) {
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: !!config.transparent });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(container.clientWidth, container.clientHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.2;
   container.appendChild(renderer.domElement);
 
-  const ambient = new THREE.AmbientLight(0xffffff, 0.4);
-  scene.add(ambient);
-  const key = new THREE.DirectionalLight(0xffffff, 1.2);
-  key.position.set(5, 8, 5);
-  scene.add(key);
-  const fill = new THREE.DirectionalLight(0xb4c6e0, 0.6);
-  fill.position.set(-3, 4, -2);
-  scene.add(fill);
-  const hemi = new THREE.HemisphereLight(0xffffff, 0x1a1a1a, 0.3);
-  scene.add(hemi);
+  const lightStore = new Map<string, LightRecord>();
+  syncLights(scene, config.lights && config.lights.length ? config.lights : createDefaultLights(), lightStore);
+
+  if (config.environment) {
+    const env = config.environment;
+    loadEquirectTexture(env.url, env.url)
+      .then((texture) => {
+        applyEnvironment(scene, renderer, texture, {
+          showBackground: env.showBackground,
+          useForReflection: env.useForReflection,
+          intensity: env.intensity,
+          blurriness: env.blurriness,
+        });
+      })
+      .catch((err) => console.error('[Web3DWidget] Umgebung konnte nicht geladen werden:', env.url, err));
+  }
 
   const loader = new GLTFLoader();
   const draco = new DRACOLoader();

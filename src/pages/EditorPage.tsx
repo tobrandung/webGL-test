@@ -1,23 +1,39 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import * as THREE from 'three';
-import { getDB, generateId, type Project, type ModelEntry, type SceneGroup } from '@/lib/db';
+import {
+  getDB,
+  generateId,
+  type Project,
+  type ModelEntry,
+  type SceneGroup,
+  type LightEntry,
+  type LightType,
+  type EnvironmentConfig,
+} from '@/lib/db';
 import { useModels } from '@/hooks/useModels';
 import { useHistory, type Command } from '@/hooks/useHistory';
 import {
   createViewport,
   loadModelFromBuffer,
-  selectModel,
+  selectObject,
   setTransformMode,
   removeModel,
+  applyViewportLights,
+  setViewportEnvironment,
+  updateBackground,
+  captureThumbnail,
   type ViewportContext,
   type TransformMode,
 } from '@/three/viewport';
+import { createDefaultLights, createLightEntry, loadEquirectTexture } from '@/three/lighting';
 import { EditorToolbar } from '@/components/EditorToolbar';
 import { ModelUploadDialog } from '@/components/ModelUploadDialog';
+import { EnvironmentUploadDialog } from '@/components/EnvironmentUploadDialog';
+import { PropertiesPanel } from '@/components/PropertiesPanel';
 import { KeyframeEditor } from '@/components/KeyframeEditor';
 import { ExportDialog } from '@/components/ExportDialog';
-import { SceneOutliner } from '@/components/SceneOutliner';
+import { SceneOutliner, type OutlinerSelectionKind } from '@/components/SceneOutliner';
 import {
   AlertDialog,
   AlertDialogContent,
@@ -40,9 +56,11 @@ export function EditorPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [transformModeState, setTransformModeState] = useState<TransformMode>('translate');
   const [showUploadDialog, setShowUploadDialog] = useState(false);
+  const [showEnvDialog, setShowEnvDialog] = useState(false);
   const [showKeyframeEditor, setShowKeyframeEditor] = useState(false);
   const [showExportDialog, setShowExportDialog] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedKind, setSelectedKind] = useState<OutlinerSelectionKind | null>(null);
   const [keyframes, setKeyframes] = useState<Keyframe[]>([]);
   const [isLoop, setIsLoop] = useState(true);
   const [cameraSpeed, setCameraSpeed] = useState(1);
@@ -52,9 +70,21 @@ export function EditorPage() {
   const [visibilityMap, setVisibilityMap] = useState<Record<string, boolean>>({});
   const [showLeaveDialog, setShowLeaveDialog] = useState(false);
   const [groups, setGroups] = useState<SceneGroup[]>([]);
+  const [lights, setLights] = useState<LightEntry[]>([]);
+  const [environment, setEnvironment] = useState<EnvironmentConfig | null>(null);
+  const [background, setBackground] = useState('#1a1a1a');
+  // The live viewport instance kept in state (not just the ref) so that effects
+  // which populate it (models, lights, environment) re-run and target the exact
+  // instance — critical under React StrictMode's mount/cleanup/mount cycle where
+  // two viewports are briefly created on the same canvas.
+  const [viewport, setViewport] = useState<ViewportContext | null>(null);
 
   const clipboardRef = useRef<{ model: ModelEntry; blobId: string } | null>(null);
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Always points at the latest performSave so the debounced auto-save doesn't
+  // fire a stale closure (captured while `project` was still null → early return).
+  const performSaveRef = useRef<(() => void) | null>(null);
+  const selectionRef = useRef<{ id: string | null; kind: OutlinerSelectionKind | null }>({ id: null, kind: null });
 
   const history = useHistory();
   const { models, addModel, updateModel, deleteModel, getModelBlob, reorderModels } = useModels(id ?? '');
@@ -71,6 +101,11 @@ export function EditorPage() {
       setIsLoop(p.cameraPath.isLoop);
       setCameraSpeed(p.cameraPath.speed);
       setGroups(p.groups ?? []);
+      // Seed default lights into state only (persisted lazily on first edit)
+      // so untouched legacy projects are not marked dirty.
+      setLights(p.lights && p.lights.length ? p.lights : createDefaultLights());
+      setEnvironment(p.environment ?? null);
+      setBackground(p.settings.background);
     })();
   }, [id, navigate]);
 
@@ -79,27 +114,122 @@ export function EditorPage() {
     if (!canvasRef.current || !project) return;
     const ctx = createViewport(canvasRef.current, project.settings.background, project.settings.transparent);
     viewportRef.current = ctx;
+    setViewport(ctx);
 
     ctx.transformControls.addEventListener('objectChange', () => {
+      // Read back a dragged light's position from the THREE object into state
+      // so the properties panel and persistence stay in sync.
+      const sel = selectionRef.current;
+      if (sel.kind === 'light' && sel.id) {
+        const record = ctx.lights.get(sel.id);
+        if (record) {
+          const p = record.light.position;
+          setLights((prev) =>
+            prev.map((l) => (l.id === sel.id ? { ...l, position: [p.x, p.y, p.z] } : l)),
+          );
+        }
+      }
       markDirty();
     });
 
-    return () => ctx.dispose();
+    return () => {
+      ctx.dispose();
+      if (viewportRef.current === ctx) viewportRef.current = null;
+      setViewport((current) => (current === ctx ? null : current));
+    };
   }, [project]);
 
-  // Load models into viewport
+  // Sync lights into the viewport whenever the light config or instance changes.
   useEffect(() => {
-    const ctx = viewportRef.current;
-    if (!ctx || !models.length) return;
+    if (!viewport) return;
+    applyViewportLights(viewport, lights);
+  }, [lights, viewport]);
+
+  // Apply the solid background colour. A visible environment dome owns
+  // `scene.background`, so skip while one is shown (the environment effect below
+  // restores the solid colour when the dome is turned off).
+  useEffect(() => {
+    if (!viewport || environment?.showBackground) return;
+    updateBackground(viewport, background, project?.settings.transparent ?? false);
+  }, [background, viewport, project, environment]);
+
+  // Mirror the latest background colour into a ref so the async environment
+  // effect can restore it without re-running when only the colour changes.
+  const backgroundRef = useRef(background);
+  useEffect(() => {
+    backgroundRef.current = background;
+  }, [background]);
+
+  // Load + apply the environment texture whenever the config or instance changes.
+  useEffect(() => {
+    const ctx = viewport;
+    if (!ctx) return;
+    let cancelled = false;
+
+    const transparent = project?.settings.transparent ?? false;
+
     (async () => {
-      for (const model of models) {
-        if (ctx.models.has(model.id)) continue;
-        const buffer = await getModelBlob(model.id);
-        if (!buffer) continue;
-        await loadModelFromBuffer(ctx, model.id, buffer, model.fileName, model.position, model.rotation, model.scale);
+      if (!environment) {
+        setViewportEnvironment(ctx, null, { showBackground: false, useForReflection: false, intensity: 1 });
+        updateBackground(ctx, backgroundRef.current, transparent);
+        return;
+      }
+      const db = await getDB();
+      const blob = await db.get('blobs', environment.blobId);
+      if (!blob || cancelled) return;
+      const texture = await loadEquirectTexture(new Blob([blob.data]), environment.fileName);
+      if (cancelled) {
+        texture.dispose();
+        return;
+      }
+      setViewportEnvironment(ctx, texture, {
+        showBackground: environment.showBackground,
+        useForReflection: environment.useForReflection,
+        intensity: environment.intensity,
+        blurriness: environment.blurriness,
+      });
+      // The dome owns scene.background only while shown; otherwise restore the
+      // solid colour the environment application may have cleared.
+      if (!environment.showBackground) {
+        updateBackground(ctx, backgroundRef.current, transparent);
       }
     })();
-  }, [models, getModelBlob]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [environment, viewport, project]);
+
+  // Load models into the viewport. Keyed on the `viewport` instance so models
+  // fetched from IndexedDB before the viewport exists (or after it is recreated)
+  // are loaded into the *live* instance — otherwise reopening a project, or the
+  // StrictMode remount, leaves the async load targeting a discarded viewport and
+  // the scene appears empty. The cleanup cancels an in-flight load on swap.
+  useEffect(() => {
+    if (!viewport || !models.length) return;
+    let cancelled = false;
+    (async () => {
+      for (const model of models) {
+        if (cancelled) return;
+        if (viewport.models.has(model.id)) continue;
+        const buffer = await getModelBlob(model.id);
+        if (cancelled) return;
+        if (!buffer) continue;
+        await loadModelFromBuffer(
+          viewport,
+          model.id,
+          buffer,
+          model.fileName,
+          model.position,
+          model.rotation,
+          model.scale,
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [viewport, models, getModelBlob]);
 
   // Auto-save
   const markDirty = useCallback(() => {
@@ -107,7 +237,7 @@ export function EditorPage() {
     setSaveStatus('dirty');
     if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
     saveTimeoutRef.current = setTimeout(() => {
-      performSave();
+      performSaveRef.current?.();
     }, 3000);
   }, []);
 
@@ -128,17 +258,41 @@ export function EditorPage() {
       }
     }
 
-    // Save camera path + outliner groups
+    // Read back live light positions from the viewport before persisting.
+    let lightsToSave = lights;
+    if (ctx) {
+      lightsToSave = lights.map((l) => {
+        const record = ctx.lights.get(l.id);
+        if (!record || record.light instanceof THREE.AmbientLight) return l;
+        const p = record.light.position;
+        return { ...l, position: [p.x, p.y, p.z] as [number, number, number] };
+      });
+    }
+
+    // Capture a fresh viewport thumbnail (falls back to the existing one).
+    // Not written back into `project` state to avoid re-triggering the
+    // viewport-init effect (which keys on the `project` reference) on every save.
+    const thumbnail = ctx ? captureThumbnail(ctx) : project.thumbnail;
+
+    // Save camera path + outliner groups + lights + environment
     await db.put('projects', {
       ...project,
+      thumbnail,
+      settings: { ...project.settings, background },
       cameraPath: { keyframes, isLoop, speed: cameraSpeed },
       groups,
+      lights: lightsToSave,
+      environment,
       updatedAt: Date.now(),
     });
 
     setSaveStatus('saved');
     setIsDirty(false);
-  }, [id, project, keyframes, isLoop, cameraSpeed, groups, updateModel]);
+  }, [id, project, keyframes, isLoop, cameraSpeed, groups, lights, environment, background, updateModel]);
+
+  useEffect(() => {
+    performSaveRef.current = performSave;
+  }, [performSave]);
 
   // Handle back navigation
   const handleBack = useCallback(() => {
@@ -223,13 +377,14 @@ export function EditorPage() {
           break;
         case 'delete':
         case 'backspace':
-          if (selectedId) {
+          if (selectionRef.current.kind === 'light' && selectionRef.current.id) {
+            handleDeleteLight(selectionRef.current.id);
+          } else if (selectedId) {
             deleteSelectedWithHistory();
           }
           break;
         case 'escape':
-          selectModel(ctx, null);
-          setSelectedId(null);
+          applySelection(null, null);
           break;
       }
     }
@@ -317,12 +472,28 @@ export function EditorPage() {
     setVisibilityMap((prev) => ({ ...prev, [modelId]: newVisible }));
   }, []);
 
-  const handleOutlinerSelect = useCallback((modelId: string | null) => {
+  const applySelection = useCallback((id: string | null, kind: OutlinerSelectionKind | null) => {
     const ctx = viewportRef.current;
+    selectionRef.current = { id, kind };
+    setSelectedId(id);
+    setSelectedKind(kind);
     if (!ctx) return;
-    selectModel(ctx, modelId);
-    setSelectedId(modelId);
+    if (kind === 'model') {
+      selectObject(ctx, id, 'model');
+    } else if (kind === 'light') {
+      selectObject(ctx, id, 'light');
+    } else {
+      // environment or cleared selection: no gizmo
+      selectObject(ctx, null, null);
+    }
   }, []);
+
+  const handleOutlinerSelect = useCallback(
+    (id: string | null, kind: OutlinerSelectionKind = 'model') => {
+      applySelection(id, id ? kind : null);
+    },
+    [applySelection],
+  );
 
   const handleOutlinerRename = useCallback(
     (modelId: string, name: string) => {
@@ -351,7 +522,11 @@ export function EditorPage() {
       if (!ctx) return;
       removeModel(ctx, modelId);
       deleteModel(modelId);
-      if (selectedId === modelId) setSelectedId(null);
+      if (selectedId === modelId) {
+        setSelectedId(null);
+        setSelectedKind(null);
+        selectionRef.current = { id: null, kind: null };
+      }
       markDirty();
     },
     [deleteModel, selectedId, markDirty],
@@ -408,6 +583,101 @@ export function EditorPage() {
     [reorderModels, markDirty],
   );
 
+  const handleAddLight = useCallback(
+    (type: LightType) => {
+      const entry = createLightEntry(type, lights.length);
+      setLights((prev) => [...prev, entry]);
+      applySelection(entry.id, 'light');
+      markDirty();
+    },
+    [lights.length, applySelection, markDirty],
+  );
+
+  const handleUpdateLight = useCallback(
+    (lightId: string, patch: Partial<LightEntry>) => {
+      setLights((prev) => prev.map((l) => (l.id === lightId ? { ...l, ...patch } : l)));
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const handleDeleteLight = useCallback(
+    (lightId: string) => {
+      setLights((prev) => prev.filter((l) => l.id !== lightId));
+      if (selectedId === lightId) applySelection(null, null);
+      markDirty();
+    },
+    [selectedId, applySelection, markDirty],
+  );
+
+  const handleToggleLightVisibility = useCallback(
+    (lightId: string) => {
+      setLights((prev) =>
+        prev.map((l) => (l.id === lightId ? { ...l, visible: l.visible === false } : l)),
+      );
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const handleRenameLight = useCallback(
+    (lightId: string, name: string) => {
+      setLights((prev) => prev.map((l) => (l.id === lightId ? { ...l, name } : l)));
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const handleEnvironmentUpload = useCallback(
+    async (file: File) => {
+      if (!id) return;
+      const db = await getDB();
+      const blobId = generateId();
+      const buffer = await file.arrayBuffer();
+      await db.put('blobs', { id: blobId, data: buffer });
+      // Drop a previously stored environment blob to avoid orphans.
+      if (environment?.blobId) await db.delete('blobs', environment.blobId).catch(() => {});
+      setEnvironment({
+        blobId,
+        fileName: file.name,
+        showBackground: false,
+        useForReflection: true,
+        intensity: 1,
+        blurriness: 0,
+      });
+      applySelection('__environment__', 'environment');
+      markDirty();
+    },
+    [id, environment, applySelection, markDirty],
+  );
+
+  const handleUpdateEnvironment = useCallback(
+    (patch: Partial<EnvironmentConfig>) => {
+      setEnvironment((prev) => (prev ? { ...prev, ...patch } : prev));
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const handleRemoveEnvironment = useCallback(async () => {
+    const current = environment;
+    setEnvironment(null);
+    if (selectedKind === 'environment') applySelection(null, null);
+    if (current?.blobId) {
+      const db = await getDB();
+      await db.delete('blobs', current.blobId).catch(() => {});
+    }
+    markDirty();
+  }, [environment, selectedKind, applySelection, markDirty]);
+
+  const handleUpdateBackground = useCallback(
+    (color: string) => {
+      setBackground(color);
+      markDirty();
+    },
+    [markDirty],
+  );
+
   const handleTransformModeChange = useCallback((mode: TransformMode) => {
     setTransformModeState(mode);
     const ctx = viewportRef.current;
@@ -436,14 +706,12 @@ export function EditorPage() {
         obj = obj.parent;
       }
       if (ctx.models.has(obj.name)) {
-        selectModel(ctx, obj.name);
-        setSelectedId(obj.name);
+        applySelection(obj.name, 'model');
         return;
       }
     }
-    selectModel(ctx, null);
-    setSelectedId(null);
-  }, []);
+    applySelection(null, null);
+  }, [applySelection]);
 
   const handleUpload = useCallback(
     async (file: File, _compress: boolean, _quality: number) => {
@@ -486,6 +754,8 @@ export function EditorPage() {
         transformMode={transformModeState}
         onTransformModeChange={handleTransformModeChange}
         onAddModel={() => setShowUploadDialog(true)}
+        onAddLight={handleAddLight}
+        onAddEnvironment={() => setShowEnvDialog(true)}
         onOpenKeyframeEditor={() => setShowKeyframeEditor(!showKeyframeEditor)}
         onExport={async () => {
           await performSave();
@@ -502,13 +772,21 @@ export function EditorPage() {
       <SceneOutliner
         models={models}
         groups={groups}
+        lights={lights}
+        environment={environment}
+        background={background}
         selectedId={selectedId}
+        selectedKind={selectedKind}
         visibilityMap={visibilityMap}
         onSelect={handleOutlinerSelect}
         onToggleVisibility={handleToggleVisibility}
         onRename={handleOutlinerRename}
         onDuplicate={handleOutlinerDuplicate}
         onDelete={handleOutlinerDelete}
+        onToggleLightVisibility={handleToggleLightVisibility}
+        onRenameLight={handleRenameLight}
+        onDeleteLight={handleDeleteLight}
+        onRemoveEnvironment={handleRemoveEnvironment}
         onCreateGroup={handleCreateGroup}
         onRenameGroup={handleRenameGroup}
         onDeleteGroup={handleDeleteGroup}
@@ -522,6 +800,19 @@ export function EditorPage() {
         className="h-full w-full"
         onClick={handleModelClick}
       />
+      {(selectedKind === 'world' ||
+        (selectedKind === 'light' && selectedId) ||
+        (selectedKind === 'environment' && environment)) && (
+        <PropertiesPanel
+          light={selectedKind === 'light' ? lights.find((l) => l.id === selectedId) ?? null : null}
+          environment={selectedKind === 'environment' ? environment : null}
+          background={selectedKind === 'world' ? background : null}
+          onUpdateLight={handleUpdateLight}
+          onUpdateEnvironment={handleUpdateEnvironment}
+          onReplaceEnvironment={() => setShowEnvDialog(true)}
+          onUpdateBackground={handleUpdateBackground}
+        />
+      )}
       {showKeyframeEditor && (
         <KeyframeEditor
           viewportCtx={viewportRef.current}
@@ -534,10 +825,11 @@ export function EditorPage() {
         />
       )}
       <ModelUploadDialog open={showUploadDialog} onOpenChange={setShowUploadDialog} onUpload={handleUpload} />
+      <EnvironmentUploadDialog open={showEnvDialog} onOpenChange={setShowEnvDialog} onUpload={handleEnvironmentUpload} />
       <ExportDialog
         open={showExportDialog}
         onOpenChange={setShowExportDialog}
-        project={{ ...project, cameraPath: { keyframes, isLoop, speed: cameraSpeed } }}
+        project={{ ...project, cameraPath: { keyframes, isLoop, speed: cameraSpeed }, lights, environment }}
       />
 
       <AlertDialog open={showLeaveDialog} onOpenChange={setShowLeaveDialog}>
