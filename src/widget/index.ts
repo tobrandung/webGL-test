@@ -132,14 +132,30 @@ function init(selector: string, config: WidgetConfig) {
   const { positionSpline, lookAtSpline } = buildSplines(config.keyframes, config.isLoop);
   let progress = 0;
 
-  // Fortschritt aus der Scroll-Position der (höheren) Eltern-Section ableiten.
+  // Sucht ab dem Container aufwärts das erste `position: sticky`-Element. So
+  // funktioniert der Scroll unabhängig davon, wie die Divs in Webflow
+  // verschachtelt sind – der Nutzer muss nur irgendwo Sticky setzen.
+  function findStickyAncestor(start: HTMLElement | null): HTMLElement | null {
+    let el: HTMLElement | null = start;
+    while (el && el !== document.body) {
+      if (getComputedStyle(el).position === 'sticky') return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  // Fortschritt aus der Scroll-Position des Sticky-Tracks ableiten. Der Track ist
+  // das Elternelement des Sticky-Elements (die hohe Section); die Reisestrecke
+  // ergibt sich aus Track-Höhe minus Höhe des gepinnten Elements.
   function computeScrollProgress(): number {
-    const track = container?.parentElement;
+    const sticky = findStickyAncestor(container);
+    const track = (sticky ?? container)?.parentElement;
     if (!track) return 0;
-    const scrollable = track.offsetHeight - window.innerHeight;
-    if (scrollable <= 0) return 0;
+    const pinnedHeight = sticky ? sticky.offsetHeight : window.innerHeight;
+    const travel = track.offsetHeight - pinnedHeight;
+    if (travel <= 0) return 0;
     const scrolled = -track.getBoundingClientRect().top;
-    return clamp01(scrolled / scrollable);
+    return clamp01(scrolled / travel);
   }
 
   function applyCamera(t: number) {
