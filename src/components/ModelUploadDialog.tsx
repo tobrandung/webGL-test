@@ -10,23 +10,18 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Slider } from '@/components/ui/slider';
-import { Switch } from '@/components/ui/switch';
 import { isSupportedModelFile } from '@/three/viewport';
 
 type ModelUploadDialogProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onUpload: (file: File, compress: boolean, quality: number) => void;
+  onUpload: (file: File) => void;
 };
 
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
 
 export function ModelUploadDialog({ open, onOpenChange, onUpload }: ModelUploadDialogProps) {
   const [file, setFile] = useState<File | null>(null);
-  const [compress, setCompress] = useState(false);
-  const [quality, setQuality] = useState([70]);
   const [error, setError] = useState('');
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -56,18 +51,14 @@ export function ModelUploadDialog({ open, onOpenChange, onUpload }: ModelUploadD
 
   const handleSubmit = () => {
     if (!file) return;
-    onUpload(file, compress, quality[0]);
+    onUpload(file);
     setFile(null);
-    setCompress(false);
-    setQuality([70]);
     onOpenChange(false);
   };
 
   const reset = () => {
     setFile(null);
     setError('');
-    setCompress(false);
-    setQuality([70]);
   };
 
   return (
@@ -78,7 +69,7 @@ export function ModelUploadDialog({ open, onOpenChange, onUpload }: ModelUploadD
         onOpenChange(v);
       }}
     >
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="min-w-0 overflow-hidden sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Modell hinzufügen</DialogTitle>
           <DialogDescription>
@@ -117,34 +108,19 @@ export function ModelUploadDialog({ open, onOpenChange, onUpload }: ModelUploadD
             />
           </div>
         ) : (
-          <div className="space-y-4">
-            <div className="flex items-center gap-3 rounded-lg bg-secondary p-3">
-              <FileBox className="h-8 w-8 text-muted-foreground" />
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-medium">{file.name}</p>
-                <p className="text-xs text-muted-foreground">
-                  {(file.size / (1024 * 1024)).toFixed(2)} MB
-                </p>
-              </div>
-              <Button variant="ghost" size="sm" onClick={reset}>
-                Ändern
-              </Button>
+          <div className="flex min-w-0 items-center gap-3 overflow-hidden rounded-lg bg-secondary p-3">
+            <FileBox className="h-8 w-8 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 flex-1 overflow-hidden">
+              <p className="truncate text-sm font-medium" title={file.name}>
+                {file.name}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {(file.size / (1024 * 1024)).toFixed(2)} MB
+              </p>
             </div>
-
-            <div className="flex items-center justify-between">
-              <Label htmlFor="compress-switch">Komprimieren (Draco)</Label>
-              <Switch id="compress-switch" checked={compress} onCheckedChange={setCompress} />
-            </div>
-
-            {compress && (
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <Label>Qualität</Label>
-                  <span className="text-sm text-muted-foreground">{quality[0]}%</span>
-                </div>
-                <Slider min={10} max={100} step={5} value={quality} onValueChange={setQuality} />
-              </div>
-            )}
+            <Button variant="ghost" size="sm" className="shrink-0" onClick={reset}>
+              Ändern
+            </Button>
           </div>
         )}
 

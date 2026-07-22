@@ -714,7 +714,7 @@ export function EditorPage() {
   }, [applySelection]);
 
   const handleUpload = useCallback(
-    async (file: File, _compress: boolean, _quality: number) => {
+    async (file: File) => {
       const newModel = await addModel(file);
       const command: Command = {
         type: 'model:add',
@@ -829,7 +829,14 @@ export function EditorPage() {
       <ExportDialog
         open={showExportDialog}
         onOpenChange={setShowExportDialog}
-        project={{ ...project, cameraPath: { keyframes, isLoop, speed: cameraSpeed }, lights, environment }}
+        project={{
+          ...project,
+          // Live-Weltfarbe mitgeben – sonst landet die zuletzt gespeicherte Farbe im Embed.
+          settings: { ...project.settings, background },
+          cameraPath: { keyframes, isLoop, speed: cameraSpeed },
+          lights,
+          environment,
+        }}
       />
 
       <AlertDialog open={showLeaveDialog} onOpenChange={setShowLeaveDialog}>

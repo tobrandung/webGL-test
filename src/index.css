@@ -130,4 +130,31 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
+
+  /* Native Scrollbars an Dark Mode anpassen (Firefox + WebKit/Blink). */
+  .dark,
+  .dark * {
+    scrollbar-width: thin;
+    scrollbar-color: oklch(1 0 0 / 22%) transparent;
+  }
+
+  .dark *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  .dark *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .dark *::-webkit-scrollbar-thumb {
+    background-color: oklch(1 0 0 / 22%);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+
+  .dark *::-webkit-scrollbar-thumb:hover {
+    background-color: oklch(1 0 0 / 35%);
+  }
 }

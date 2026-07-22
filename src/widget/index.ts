@@ -12,6 +12,9 @@ import type { LightEntry } from '@/lib/db';
 
 type Vec3 = [number, number, number];
 
+/** Obergrenze für den internen Render-Framebuffer (in Pixeln). */
+type MaxResolution = { width: number; height: number };
+
 type ModelConfig = {
   url: string;
   position?: Vec3;
@@ -42,7 +45,37 @@ type WidgetConfig = {
   lights?: LightEntry[];
   /** Optionale equirektanguläre Umgebung für Spiegelung/Hintergrund. */
   environment?: EnvironmentWidgetConfig;
+  /**
+   * Deckelt die interne Render-Auflösung (Framebuffer), z. B. auf Full HD.
+   * Die CSS-Größe bleibt unberührt – das Modell skaliert weiter mit dem
+   * Container, es wird nur nicht in nativer 4K/5K-Pixelzahl gerendert.
+   * `null`/undefined = unbegrenzt (nur devicePixelRatio-Cap greift).
+   */
+  maxResolution?: MaxResolution | null;
 };
+
+/**
+ * Ermittelt den effektiven Pixel-Ratio, sodass der Framebuffer die konfigurierte
+ * Maximalauflösung nicht überschreitet. Orientierungsunabhängig (die längere
+ * Kante der Auflösung deckt die längere Container-Kante ab), damit z. B. Full HD
+ * sowohl im Quer- als auch im Hochformat greift.
+ */
+function computePixelRatio(container: HTMLElement, maxResolution?: MaxResolution | null): number {
+  const dpr = window.devicePixelRatio || 1;
+  const baseCap = Math.min(dpr, 2);
+  if (!maxResolution) return baseCap;
+
+  const cssLong = Math.max(container.clientWidth, container.clientHeight);
+  const cssShort = Math.min(container.clientWidth, container.clientHeight);
+  if (cssLong <= 0 || cssShort <= 0) return baseCap;
+
+  const resLong = Math.max(maxResolution.width, maxResolution.height);
+  const resShort = Math.min(maxResolution.width, maxResolution.height);
+  const resolutionCap = Math.min(resLong / cssLong, resShort / cssShort);
+
+  // Nicht über den Geräte-Ratio hinaus hochskalieren, aber mind. 0.5 für Lesbarkeit.
+  return Math.max(0.5, Math.min(baseCap, resolutionCap));
+}
 
 function buildSplines(keyframes: WidgetConfig['keyframes'], isLoop: boolean) {
   if (keyframes.length < 2) return { positionSpline: null, lookAtSpline: null };
@@ -79,7 +112,7 @@ function init(selector: string, config: WidgetConfig) {
   camera.position.set(3, 2, 5);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: !!config.transparent });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setPixelRatio(computePixelRatio(container, config.maxResolution));
   renderer.setSize(container.clientWidth, container.clientHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -196,6 +229,7 @@ function init(selector: string, config: WidgetConfig) {
   const ro = new ResizeObserver(() => {
     camera.aspect = container.clientWidth / container.clientHeight;
     camera.updateProjectionMatrix();
+    renderer.setPixelRatio(computePixelRatio(container, config.maxResolution));
     renderer.setSize(container.clientWidth, container.clientHeight);
   });
   ro.observe(container);

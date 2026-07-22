@@ -1,5 +1,24 @@
-import { useState, useCallback, useEffect } from 'react';
-import { Copy, Check, Download, AlertTriangle, FolderDown, Upload, Loader2 } from 'lucide-react';
+import {
+  useState,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  type ReactNode,
+} from 'react';
+import {
+  Copy,
+  Check,
+  Download,
+  AlertTriangle,
+  FolderDown,
+  Upload,
+  Loader2,
+  Settings2,
+  Cloud,
+  Code2,
+  Info,
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -7,15 +26,96 @@ import {
   DialogHeader,
   DialogTitle,
   DialogDescription,
+  DialogFooter,
 } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { Separator } from '@/components/ui/separator';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { getDB, type Project, type ModelEntry } from '@/lib/db';
-import { slugify } from '@/lib/utils';
+import { cn, slugify } from '@/lib/utils';
 
 type ExportMode = 'scroll' | 'autoplay' | 'loop';
+type ExportTab = 'display' | 'hosting' | 'embed';
+
+const EXPORT_TABS: ExportTab[] = ['display', 'hosting', 'embed'];
+
+/** Obergrenze für den animierten Content-Bereich (Rest bleibt Header/Tabs/Footer). */
+function maxExportPanelHeight(): number {
+  if (typeof window === 'undefined') return 480;
+  return Math.min(window.innerHeight * 0.52, window.innerHeight * 0.85 - 180);
+}
+
+const EXPORT_MODES: Array<{ id: ExportMode; label: string; hint: string }> = [
+  { id: 'scroll', label: 'Scroll', hint: 'Die Kamera folgt dem Scroll-Fortschritt der Seite.' },
+  { id: 'autoplay', label: 'Autoplay', hint: 'Die Kamerafahrt startet automatisch und läuft einmal durch.' },
+  { id: 'loop', label: 'Loop', hint: 'Die Kamerafahrt läuft automatisch in einer Endlosschleife.' },
+];
+
+type ResolutionPreset = {
+  id: string;
+  label: string;
+  /** null = keine Begrenzung (rendert in nativer Container-Auflösung). */
+  resolution: { width: number; height: number } | null;
+};
+
+// Gängige Auflösungen als Obergrenze für den Render-Framebuffer. Full HD ist
+// die Voreinstellung – reicht für die meisten Web-Einbettungen und verhindert,
+// dass auf 4K/5K-Displays unnötig viele Pixel gerendert werden (Ruckeln).
+const RESOLUTION_PRESETS: ResolutionPreset[] = [
+  { id: 'hd', label: 'HD (1280×720)', resolution: { width: 1280, height: 720 } },
+  { id: 'fhd', label: 'Full HD (1920×1080)', resolution: { width: 1920, height: 1080 } },
+  { id: 'qhd', label: '2K QHD (2560×1440)', resolution: { width: 2560, height: 1440 } },
+  { id: 'uhd', label: '4K UHD (3840×2160)', resolution: { width: 3840, height: 2160 } },
+  { id: 'unlimited', label: 'Unbegrenzt (nativ)', resolution: null },
+];
+
+const DEFAULT_RESOLUTION_ID = 'fhd';
+
+// GitHub-Token wird lokal im Browser gespeichert, damit er nicht bei jedem
+// Export neu eingegeben werden muss. Hinweis: localStorage ist bei XSS lesbar –
+// bewusster Komfort-Kompromiss auf Wunsch. Nur Fine-grained-Token mit minimalem
+// Scope verwenden.
+const TOKEN_STORAGE_KEY = 'web3d-export-gh-token';
+
+/** Kompakter, dateisystemsicherer Zeitstempel wie 20260713-134500. */
+function formatStamp(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/** Kleiner Info-/Warn-Button, der Detailtexte in einen Tooltip auslagert. */
+function InfoHint({
+  children,
+  variant = 'info',
+  label = 'Mehr Infos',
+}: {
+  children: ReactNode;
+  variant?: 'info' | 'warning';
+  label?: string;
+}) {
+  const Icon = variant === 'warning' ? AlertTriangle : Info;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={label}
+          className={cn(
+            'inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+            variant === 'warning' && 'text-orange-400 hover:text-orange-300',
+          )}
+        >
+          <Icon className="h-3.5 w-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs text-left leading-relaxed">{children}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 type ExportDialogProps = {
   open: boolean;
@@ -108,7 +208,8 @@ async function putFileToGitHub(params: {
 
 export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps) {
   const [exportMode, setExportMode] = useState<ExportMode>('scroll');
-  const [transparent, setTransparent] = useState(false);
+  const [transparent, setTransparent] = useState(true);
+  const [resolutionId, setResolutionId] = useState(DEFAULT_RESOLUTION_ID);
   const [copied, setCopied] = useState(false);
   const [owner, setOwner] = useState('tobrandung');
   const [repo, setRepo] = useState('webGL-test');
@@ -118,16 +219,28 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
   const [folderStatus, setFolderStatus] = useState<string | null>(null);
   const [includeEnv, setIncludeEnv] = useState(true);
   const [envFolderStatus, setEnvFolderStatus] = useState<string | null>(null);
-  const [token, setToken] = useState('');
+  const [token, setToken] = useState(() =>
+    typeof window !== 'undefined' ? (localStorage.getItem(TOKEN_STORAGE_KEY) ?? '') : '',
+  );
   const [uploading, setUploading] = useState(false);
   const [uploadLog, setUploadLog] = useState<string[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
   // Commit SHA of the most recent GitHub upload. When set, embed URLs are pinned
   // to it (immutable → jsDelivr serves fresh content without cache purge).
   const [deployedSha, setDeployedSha] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<ExportTab>('display');
+  /** 1 = nach rechts, -1 = nach links – steuert die Slide-Richtung des Contents. */
+  const [tabSlideDir, setTabSlideDir] = useState(1);
+  const [panelHeight, setPanelHeight] = useState<number | undefined>(undefined);
+  const [panelScrollable, setPanelScrollable] = useState(false);
+  const [tabIndicator, setTabIndicator] = useState({ left: 0, width: 0 });
+  const panelRef = useRef<HTMLDivElement>(null);
+  const tabsListRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open || !project) return;
+    // Jeder Export startet mit transparentem Hintergrund.
+    setTransparent(true);
     (async () => {
       const db = await getDB();
       const all = await db.getAllFromIndex('models', 'by-project', project.id);
@@ -141,6 +254,105 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
     setDeployedSha(null);
   }, [owner, repo, branch, open, project]);
 
+  // Token lokal spiegeln, damit er beim nächsten Export wieder vorausgefüllt ist.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (token) localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    else localStorage.removeItem(TOKEN_STORAGE_KEY);
+  }, [token]);
+
+  // Beim Schließen Höhe zurücksetzen, damit der nächste Open frisch misst.
+  useEffect(() => {
+    if (open) return;
+    setPanelHeight(undefined);
+    setPanelScrollable(false);
+  }, [open]);
+
+  // Modal-Höhe weich mitführen.
+  // Wichtig: Höhe erst NACH dem Paint setzen (rAF), sonst sieht der Browser
+  // alten und neuen Wert im selben Frame und die CSS-Transition startet nicht.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const el = panelRef.current;
+    if (!el) return;
+
+    const measure = () => {
+      const natural = el.scrollHeight;
+      const max = maxExportPanelHeight();
+      return {
+        height: Math.min(natural, max),
+        scrollable: natural > max,
+      };
+    };
+
+    let raf1 = 0;
+    let raf2 = 0;
+    const { height: nextHeight, scrollable } = measure();
+
+    if (panelHeight === undefined) {
+      // Erster Open: sofort setzen, nichts zu animieren.
+      setPanelHeight(nextHeight);
+      setPanelScrollable(scrollable);
+    } else {
+      raf1 = requestAnimationFrame(() => {
+        raf2 = requestAnimationFrame(() => {
+          setPanelHeight(nextHeight);
+          setPanelScrollable(scrollable);
+        });
+      });
+    }
+
+    // Spätere Inhaltsänderungen (Upload-Log etc.) ohne Tab-Wechsel.
+    const ro = new ResizeObserver(() => {
+      const m = measure();
+      setPanelHeight(m.height);
+      setPanelScrollable(m.scrollable);
+    });
+    // RO erst nach der Tab-Animation anbinden, sonst killt er die Transition.
+    const roTimer = window.setTimeout(() => ro.observe(el), 350);
+    const onResize = () => {
+      const m = measure();
+      setPanelHeight(m.height);
+      setPanelScrollable(m.scrollable);
+    };
+    window.addEventListener('resize', onResize);
+
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      window.clearTimeout(roTimer);
+      ro.disconnect();
+      window.removeEventListener('resize', onResize);
+    };
+    // panelHeight absichtlich nicht in deps – sonst Endlosschleife.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- height sync on tab/content change only
+  }, [open, activeTab, exportMode, resolutionId, transparent, includeEnv, models, project?.environment, uploading, uploadLog, uploadError, folderStatus, envFolderStatus, deployedSha, owner, repo, branch, copied]);
+
+  // Sliding Pill unter dem aktiven Tab.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const list = tabsListRef.current;
+    if (!list) return;
+
+    const updateIndicator = () => {
+      const active = list.querySelector<HTMLElement>('[data-state="active"]');
+      if (!active) return;
+      setTabIndicator({ left: active.offsetLeft, width: active.offsetWidth });
+    };
+
+    // Ein Frame warten, damit data-state=active am DOM steht.
+    const id = requestAnimationFrame(updateIndicator);
+    return () => cancelAnimationFrame(id);
+  }, [open, activeTab]);
+
+  const handleTabChange = useCallback((next: string) => {
+    const nextTab = next as ExportTab;
+    const prevIdx = EXPORT_TABS.indexOf(activeTab);
+    const nextIdx = EXPORT_TABS.indexOf(nextTab);
+    setTabSlideDir(nextIdx >= prevIdx ? 1 : -1);
+    setActiveTab(nextTab);
+  }, [activeTab]);
+
   const projectSlug = project ? slugify(project.name) : '';
   // Pin to the uploaded commit when available; otherwise track the branch.
   const ref = deployedSha ?? branch;
@@ -149,7 +361,10 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
   // A commit-pinned script URL is immutable, so the cache-busting query is only
   // needed for the mutable @branch fallback.
   const scriptUrl = `${baseUrl}/dist-widget/web3d-widget.iife.js${deployedSha ? '' : '?v=2'}`;
-  const modelFileName = (m: ModelEntry) => `${m.id}.${fileExtension(m.fileName)}`;
+  // Sprechender, dateisystem- und URL-sicherer Name: Modellname (slugifiziert,
+  // gekürzt) + Erstell-Zeitstempel für Eindeutigkeit. Ersetzt die lange UUID.
+  const modelFileName = (m: ModelEntry) =>
+    `${slugify(m.name).slice(0, 40)}-${formatStamp(m.createdAt)}.${fileExtension(m.fileName)}`;
   // jsDelivr refuses GitHub files larger than 20 MiB (HTTP 403). Fall back to
   // raw.githubusercontent.com (CORS-enabled, 100 MB limit) for oversized assets.
   const JSDELIVR_MAX_BYTES = 20 * 1024 * 1024;
@@ -181,6 +396,11 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
       speed: project.cameraPath.speed,
       models: mappedModels,
     };
+
+    const maxResolution = RESOLUTION_PRESETS.find((p) => p.id === resolutionId)?.resolution;
+    if (maxResolution) {
+      config.maxResolution = maxResolution;
+    }
 
     // Rückwärtskompatibel: ältere Widget-Builds auf jsDelivr lesen nur modelUrl.
     if (mappedModels.length === 1) {
@@ -236,7 +456,7 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
   document.head.appendChild(s);
 })();
 <\/script>`;
-  }, [project, exportMode, transparent, models, scriptUrl, baseUrl, environment, includeEnv, envPath]);
+  }, [project, exportMode, transparent, resolutionId, models, scriptUrl, baseUrl, environment, includeEnv, envPath]);
 
   const handleCopy = useCallback(async () => {
     await navigator.clipboard.writeText(getEmbedCode());
@@ -391,215 +611,331 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
   const hasEnoughKeyframes = project.cameraPath.keyframes.length >= 2;
   const canUpload = Boolean(token && owner && repo) && (models.length > 0 || (environment && includeEnv));
 
+  const activeMode = EXPORT_MODES.find((m) => m.id === exportMode) ?? EXPORT_MODES[0];
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-xl">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[85vh] flex-col gap-0 overflow-hidden border-border/50 bg-background/70 p-0 backdrop-blur-[24px] sm:max-w-2xl">
+        <DialogHeader className="shrink-0 px-6 pt-6">
           <DialogTitle>Widget exportieren</DialogTitle>
           <DialogDescription>
             Generiere ein Embed-Snippet für Webflow, Slater oder dein eigenes Projekt.
           </DialogDescription>
         </DialogHeader>
 
-        <div className="min-w-0 space-y-4">
-          {!hasEnoughKeyframes && (
-            <div className="flex items-start gap-2 rounded-md border border-orange-500/40 bg-orange-500/10 p-3 text-xs text-orange-300">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span>
-                Dieses Projekt hat weniger als 2 Keyframes. Ohne Kamerafahrt bewegt sich die Kamera
-                nicht. Erstelle zuerst im Keyframe-Editor mindestens 2 Keyframes.
-              </span>
-            </div>
-          )}
+        {!hasEnoughKeyframes && (
+          <div className="mx-6 mt-4 flex shrink-0 items-start gap-2 rounded-md border border-orange-500/40 bg-orange-500/10 p-3 text-xs text-orange-300">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>
+              Dieses Projekt hat weniger als 2 Keyframes. Ohne Kamerafahrt bewegt sich die Kamera
+              nicht. Erstelle zuerst im Keyframe-Editor mindestens 2 Keyframes.
+            </span>
+          </div>
+        )}
 
-          <div className="space-y-2">
-            <Label>Modus</Label>
-            <div className="flex gap-2">
-              {(['scroll', 'autoplay', 'loop'] as ExportMode[]).map((m) => (
-                <Button
-                  key={m}
-                  variant={exportMode === m ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setExportMode(m)}
-                >
-                  {m === 'scroll' ? 'Scroll' : m === 'autoplay' ? 'Autoplay' : 'Loop'}
-                </Button>
-              ))}
-            </div>
+        <Tabs
+          value={activeTab}
+          onValueChange={handleTabChange}
+          className="flex min-h-0 flex-1 flex-col gap-0"
+        >
+          <div className="shrink-0 px-6 pt-4">
+            <TabsList ref={tabsListRef} className="relative">
+              <span
+                aria-hidden
+                className="pointer-events-none absolute top-1 bottom-1 rounded-md bg-background shadow-sm transition-[left,width] duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none"
+                style={{ left: tabIndicator.left, width: tabIndicator.width }}
+              />
+              <TabsTrigger
+                value="display"
+                className="relative z-10 data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+              >
+                <Settings2 />
+                <span className="hidden sm:inline">Anzeige</span>
+              </TabsTrigger>
+              <TabsTrigger
+                value="hosting"
+                className="relative z-10 data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+              >
+                <Cloud />
+                <span className="hidden sm:inline">Hosting</span>
+              </TabsTrigger>
+              <TabsTrigger
+                value="embed"
+                className="relative z-10 data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+              >
+                <Code2 />
+                <span className="hidden sm:inline">Embed-Code</span>
+              </TabsTrigger>
+            </TabsList>
           </div>
 
-          <div className="flex items-center justify-between">
-            <Label htmlFor="export-transparent">Transparenter Hintergrund</Label>
-            <Switch id="export-transparent" checked={transparent} onCheckedChange={setTransparent} />
-          </div>
-
-          <Separator />
-
-          <div className="space-y-2">
-            <Label>GitHub-Repo (für jsDelivr-Hosting)</Label>
-            <div className="grid grid-cols-3 gap-2">
-              <Input value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="owner" />
-              <Input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="repo" />
-              <Input value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="branch" />
-            </div>
-            <p className="text-xs text-muted-foreground">
-              Script wird geladen von{' '}
-              <code className="break-all text-foreground">{scriptUrl}</code>
-            </p>
-            {deployedSha && (
-              <p className="text-xs text-green-400">
-                Auf Commit <code className="text-foreground">{deployedSha.slice(0, 7)}</code> gepinnt –
-                unveränderliche URLs, kein jsDelivr-Cache-Problem.
-              </p>
+          <div
+            className={cn(
+              'overflow-x-hidden transition-[height] duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none',
+              panelScrollable ? 'overflow-y-auto' : 'overflow-hidden',
             )}
-            <div className="flex items-start gap-2 rounded-md border border-orange-500/40 bg-orange-500/10 p-3 text-xs text-orange-300">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span>
-                jsDelivr kann nur aus <strong>öffentlichen</strong> GitHub-Repos laden. Ist dein Repo
-                privat, bekommst du 404 und nichts wird angezeigt. Entweder Repo auf Public stellen
-                oder Widget + Modelle in Webflow Assets hochladen und die URLs im Embed-Code anpassen.
-              </span>
-            </div>
-          </div>
-
-          <Separator />
-
-          <div className="space-y-2">
-            <Label htmlFor="gh-token">Direkt nach GitHub hochladen</Label>
-            <Input
-              id="gh-token"
-              type="password"
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              placeholder="GitHub Personal Access Token"
-              autoComplete="off"
-            />
-            <p className="text-xs text-muted-foreground">
-              Token mit Schreibrecht auf <code className="text-foreground">Contents</code> (Fine-grained:
-              „Contents: Read and write" für{' '}
-              <code className="text-foreground">
-                {owner}/{repo}
-              </code>
-              , oder Classic-Token mit <code className="text-foreground">repo</code>-Scope). Der Token wird
-              nur im Browser verwendet und nirgends gespeichert.
-            </p>
-
-            <Button
-              variant="default"
-              size="sm"
-              className="w-full"
-              disabled={!canUpload || uploading}
-              onClick={uploadToGitHub}
-            >
-              {uploading ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              ) : (
-                <Upload className="mr-2 h-4 w-4" />
-              )}
-              {uploading
-                ? 'Lade hoch…'
-                : `Nach ${owner}/${repo} hochladen (Modelle${environment && includeEnv ? ' + HDRI' : ''})`}
-            </Button>
-
-            {uploadLog.length > 0 && (
-              <pre className="max-h-32 overflow-auto rounded-md bg-secondary p-2 text-[11px] text-green-400">
-                {uploadLog.join('\n')}
-              </pre>
-            )}
-            {uploadError && (
-              <div className="flex items-start gap-2 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-xs text-red-300">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                <span>Upload fehlgeschlagen: {uploadError}</span>
-              </div>
-            )}
-          </div>
-
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <Label>Modelle</Label>
-              <span className="text-xs text-muted-foreground">
-                {models.length} {models.length === 1 ? 'Modell' : 'Modelle'}
-              </span>
-            </div>
-
-            {models.length > 0 && supportsFsAccess && (
-              <div className="space-y-1">
-                <Button
-                  variant="default"
-                  size="sm"
-                  className="w-full"
-                  disabled={savingFolder}
-                  onClick={saveModelsToFolder}
-                >
-                  <FolderDown className="mr-2 h-4 w-4" />
-                  {savingFolder ? 'Speichere…' : 'Modelle in Ordner speichern'}
-                </Button>
-                <p className="text-xs text-muted-foreground">
-                  Wähle deinen lokalen Ordner{' '}
-                  <code className="text-foreground">dist-widget/models</code> – die Modelle werden
-                  automatisch nach{' '}
-                  <code className="break-all text-foreground">{projectSlug}/</code> geschrieben.
-                </p>
-                {folderStatus && (
-                  <p className="text-xs text-green-400">{folderStatus}</p>
+            style={{ height: panelHeight }}
+          >
+            <div ref={panelRef} className="px-6 py-5">
+              <div
+                key={activeTab}
+                role="tabpanel"
+                className={cn(
+                  'animate-in fade-in-0 duration-300 fill-mode-both motion-reduce:animate-none',
+                  tabSlideDir >= 0 ? 'slide-in-from-right-2' : 'slide-in-from-left-2',
                 )}
-              </div>
-            )}
-
-            {models.length === 0 ? (
-              <p className="text-xs text-muted-foreground">Keine Modelle im Projekt.</p>
-            ) : (
-              <div className="space-y-1">
-                {models.map((m) => (
-                  <div key={m.id} className="flex items-center gap-2 rounded-md bg-secondary px-3 py-2">
-                    <span className="min-w-0 flex-1 truncate text-xs">{m.name}</span>
-                    <Button variant="ghost" size="sm" className="shrink-0" onClick={() => downloadModel(m)}>
-                      <Download className="mr-1 h-3.5 w-3.5" />
-                      {modelFileName(m)}
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            )}
-            <p className="text-xs text-muted-foreground">
-              {supportsFsAccess
-                ? 'Alternativ einzeln herunterladen und '
-                : 'Lade jedes Modell herunter und lege es '}
-              im Repo unter{' '}
-              <code className="break-all text-foreground">dist-widget/models/{projectSlug}/</code>{' '}
-              ablegen. Danach committen &amp; pushen – jsDelivr liefert die Dateien aus.
-            </p>
-
-            {oversizedModels.length > 0 && (
-              <div className="flex items-start gap-2 rounded-md border border-orange-500/40 bg-orange-500/10 p-3 text-xs text-orange-300">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                <span>
-                  {oversizedModels.length === 1 ? 'Ein Modell ist' : `${oversizedModels.length} Modelle sind`}{' '}
-                  größer als 20&nbsp;MiB und werden von jsDelivr mit 403 abgelehnt. Der Embed-Code lädt
-                  diese daher über <code className="text-foreground">raw.githubusercontent.com</code>{' '}
-                  (funktioniert, ist aber kein CDN). Für schnelleres Laden das GLB komprimieren (Draco /
-                  Texturen), damit es unter 20&nbsp;MiB kommt.
-                </span>
-              </div>
-            )}
-          </div>
-
-          {environment && (
-            <>
-              <Separator />
+              >
+            {/* Tab 1 – Anzeige: rein visuelle/verhaltensbezogene Optionen. */}
+            {activeTab === 'display' && (
+            <div className="space-y-6">
               <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <Label htmlFor="export-include-env">HDRI / Umgebung einbeziehen</Label>
+                <Label>Abspielmodus</Label>
+                <div className="flex flex-wrap gap-2">
+                  {EXPORT_MODES.map((m) => (
+                    <Button
+                      key={m.id}
+                      variant={exportMode === m.id ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => setExportMode(m.id)}
+                    >
+                      {m.label}
+                    </Button>
+                  ))}
+                </div>
+                <p className="text-xs text-muted-foreground">{activeMode.hint}</p>
+              </div>
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0 space-y-0.5">
+                  <Label htmlFor="export-transparent">Transparenter Hintergrund</Label>
+                  <p className="text-xs text-muted-foreground">
+                    {transparent
+                      ? 'Zeigt die Seite hinter dem 3D-Widget durch.'
+                      : 'Nutzt die Hintergrundfarbe aus der Welt-Einstellung.'}
+                  </p>
+                  {!transparent && (
+                    <div className="flex items-center gap-2 pt-1">
+                      <span
+                        className="h-4 w-4 shrink-0 rounded-sm border border-border"
+                        style={{ backgroundColor: project.settings.background }}
+                        aria-hidden
+                      />
+                      <code className="text-xs text-foreground">{project.settings.background}</code>
+                    </div>
+                  )}
+                </div>
+                <Switch id="export-transparent" checked={transparent} onCheckedChange={setTransparent} />
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center gap-1.5">
+                  <Label>Max. Render-Auflösung</Label>
+                  <InfoHint>
+                    Deckelt die interne Render-Auflösung. Das Widget füllt weiterhin den ganzen
+                    Container (skaliert in der Größe mit), rendert aber nicht in nativer
+                    4K/5K-Pixelzahl – das verhindert Ruckeln auf hochauflösenden Displays.
+                  </InfoHint>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {RESOLUTION_PRESETS.map((preset) => (
+                    <Button
+                      key={preset.id}
+                      variant={resolutionId === preset.id ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => setResolutionId(preset.id)}
+                    >
+                      {preset.label}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+
+              {environment && (
+                <div className="flex items-center justify-between gap-4">
+                  <div className="space-y-0.5">
+                    <Label htmlFor="export-include-env">HDRI / Umgebung einbeziehen</Label>
+                    <p className="text-xs text-muted-foreground">
+                      {environment.showBackground
+                        ? 'Wird als Hintergrund und Spiegelung eingebettet.'
+                        : 'Transparenter Hintergrund, Spiegelung im Modell bleibt erhalten.'}
+                    </p>
+                  </div>
                   <Switch id="export-include-env" checked={includeEnv} onCheckedChange={setIncludeEnv} />
                 </div>
+              )}
+            </div>
+            )}
+
+            {/* Tab 2 – Hosting: Repo-Ziel, Upload und Asset-Dateien. */}
+            {activeTab === 'hosting' && (
+            <div className="space-y-6">
+              <div className="space-y-2">
+                <div className="flex items-center gap-1.5">
+                  <Label>GitHub-Repo (für jsDelivr-Hosting)</Label>
+                  <InfoHint variant="warning" label="Hinweis zum Repo">
+                    jsDelivr kann nur aus <strong>öffentlichen</strong> GitHub-Repos laden. Ist dein
+                    Repo privat, bekommst du 404 und nichts wird angezeigt. Entweder Repo auf Public
+                    stellen oder Widget + Modelle in Webflow Assets hochladen und die URLs im
+                    Embed-Code anpassen.
+                  </InfoHint>
+                </div>
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                  <div className="space-y-1">
+                    <span className="text-[11px] text-muted-foreground">Owner</span>
+                    <Input value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="owner" />
+                  </div>
+                  <div className="space-y-1">
+                    <span className="text-[11px] text-muted-foreground">Repo</span>
+                    <Input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="repo" />
+                  </div>
+                  <div className="space-y-1">
+                    <span className="text-[11px] text-muted-foreground">Branch</span>
+                    <Input value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="branch" />
+                  </div>
+                </div>
                 <p className="text-xs text-muted-foreground">
-                  {environment.showBackground
-                    ? 'Wird als Hintergrund und Spiegelung eingebettet.'
-                    : 'Transparenter Hintergrund, Spiegelung im Modell bleibt erhalten.'}
+                  Script wird geladen von{' '}
+                  <code className="break-all text-foreground">{scriptUrl}</code>
+                </p>
+                {deployedSha && (
+                  <p className="text-xs text-green-400">
+                    Auf Commit <code className="text-foreground">{deployedSha.slice(0, 7)}</code> gepinnt –
+                    unveränderliche URLs, kein jsDelivr-Cache-Problem.
+                  </p>
+                )}
+              </div>
+
+              <Separator />
+
+              <div className="space-y-2">
+                <div className="flex items-center gap-1.5">
+                  <Label htmlFor="gh-token">Direkt nach GitHub hochladen</Label>
+                  <InfoHint label="Token-Hinweis">
+                    Token mit Schreibrecht auf <code>Contents</code> (Fine-grained: „Contents: Read
+                    and write" für{' '}
+                    <code>
+                      {owner}/{repo}
+                    </code>
+                    , oder Classic-Token mit <code>repo</code>-Scope).
+                  </InfoHint>
+                </div>
+                <Input
+                  id="gh-token"
+                  type="password"
+                  value={token}
+                  onChange={(e) => setToken(e.target.value)}
+                  placeholder="GitHub Personal Access Token"
+                  autoComplete="off"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Wird lokal in diesem Browser gespeichert und beim nächsten Export vorausgefüllt.
                 </p>
 
-                {includeEnv && (
-                  <>
+                <Button
+                  variant="default"
+                  className="w-full"
+                  disabled={!canUpload || uploading}
+                  onClick={uploadToGitHub}
+                >
+                  {uploading ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Upload className="mr-2 h-4 w-4" />
+                  )}
+                  {uploading
+                    ? 'Lade hoch…'
+                    : `Nach ${owner}/${repo} hochladen (Modelle${environment && includeEnv ? ' + HDRI' : ''})`}
+                </Button>
+
+                {uploadLog.length > 0 && (
+                  <pre className="max-h-32 overflow-auto rounded-md bg-secondary p-2 text-[11px] text-green-400">
+                    {uploadLog.join('\n')}
+                  </pre>
+                )}
+                {uploadError && (
+                  <div className="flex items-start gap-2 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-xs text-red-300">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>Upload fehlgeschlagen: {uploadError}</span>
+                  </div>
+                )}
+              </div>
+
+              <Separator />
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-1.5">
+                    <Label>Modelle</Label>
+                    <InfoHint label="Ablage-Hinweis">
+                      {supportsFsAccess
+                        ? 'Alternativ einzeln herunterladen und '
+                        : 'Lade jedes Modell herunter und lege es '}
+                      im Repo unter <code>dist-widget/models/{projectSlug}/</code> ablegen. Danach
+                      committen &amp; pushen – jsDelivr liefert die Dateien aus.
+                    </InfoHint>
+                  </div>
+                  <span className="text-xs text-muted-foreground">
+                    {models.length} {models.length === 1 ? 'Modell' : 'Modelle'}
+                  </span>
+                </div>
+
+                {models.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">Keine Modelle im Projekt.</p>
+                ) : (
+                  <div className="space-y-1">
+                    {models.map((m) => (
+                      <div key={m.id} className="flex items-center gap-2 rounded-md bg-secondary px-3 py-2">
+                        <span className="min-w-0 flex-1 truncate text-xs">{m.name}</span>
+                        <Button variant="ghost" size="sm" className="shrink-0" onClick={() => downloadModel(m)}>
+                          <Download className="mr-1 h-3.5 w-3.5" />
+                          {modelFileName(m)}
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {models.length > 0 && supportsFsAccess && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="w-full"
+                    disabled={savingFolder}
+                    onClick={saveModelsToFolder}
+                  >
+                    <FolderDown className="mr-2 h-4 w-4" />
+                    {savingFolder ? 'Speichere…' : 'Modelle in Ordner speichern'}
+                  </Button>
+                )}
+                {folderStatus && <p className="text-xs text-green-400">{folderStatus}</p>}
+
+                {oversizedModels.length > 0 && (
+                  <div className="flex items-center gap-1.5 text-xs text-orange-400">
+                    <span>
+                      {oversizedModels.length === 1
+                        ? '1 Modell über 20 MiB'
+                        : `${oversizedModels.length} Modelle über 20 MiB`}
+                    </span>
+                    <InfoHint variant="warning" label="Große Modelle">
+                      Dateien über 20&nbsp;MiB werden von jsDelivr mit 403 abgelehnt. Der Embed-Code
+                      lädt sie daher über <code>raw.githubusercontent.com</code> (funktioniert, ist
+                      aber kein CDN). Für schnelleres Laden das GLB komprimieren (Draco / Texturen),
+                      damit es unter 20&nbsp;MiB kommt.
+                    </InfoHint>
+                  </div>
+                )}
+              </div>
+
+              {environment && includeEnv && (
+                <>
+                  <Separator />
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-1.5">
+                      <Label>HDRI / Umgebung</Label>
+                      <InfoHint label="Ablage-Hinweis">
+                        Datei im Repo unter <code>dist-widget/env/{projectSlug}/</code> ablegen.
+                      </InfoHint>
+                    </div>
                     <div className="flex items-center gap-2 rounded-md bg-secondary px-3 py-2">
                       <span className="min-w-0 flex-1 truncate text-xs">{environment.fileName}</span>
                       <Button variant="ghost" size="sm" className="shrink-0" onClick={downloadEnv}>
@@ -608,48 +944,52 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
                       </Button>
                     </div>
                     {supportsFsAccess && (
-                      <Button variant="default" size="sm" className="w-full" onClick={saveEnvToFolder}>
+                      <Button variant="outline" size="sm" className="w-full" onClick={saveEnvToFolder}>
                         <FolderDown className="mr-2 h-4 w-4" />
                         Umgebung in Ordner speichern
                       </Button>
                     )}
                     {envFolderStatus && <p className="text-xs text-green-400">{envFolderStatus}</p>}
-                    <p className="text-xs text-muted-foreground">
-                      Datei im Repo unter{' '}
-                      <code className="break-all text-foreground">dist-widget/env/{projectSlug}/</code> ablegen.
-                    </p>
+                  </div>
+                </>
+              )}
+            </div>
+            )}
+
+            {/* Tab 3 – Embed-Code: das finale Deliverable mit primärer Kopieren-Aktion. */}
+            {activeTab === 'embed' && (
+            <div className="space-y-3">
+              <Button className="w-full" onClick={handleCopy}>
+                {copied ? (
+                  <>
+                    <Check className="mr-2 h-4 w-4" />
+                    Kopiert
+                  </>
+                ) : (
+                  <>
+                    <Copy className="mr-2 h-4 w-4" />
+                    Embed-Code kopieren
                   </>
                 )}
-              </div>
-            </>
-          )}
-
-          <Separator />
-
-          <div className="space-y-2">
-            <Label>Embed-Code</Label>
-            <div className="relative min-w-0">
-              <pre className="max-h-56 w-full overflow-auto rounded-lg bg-secondary p-4 pr-10 text-xs">
+              </Button>
+              <pre className="max-h-72 w-full overflow-auto rounded-lg bg-secondary p-4 text-xs">
                 <code>{getEmbedCode()}</code>
               </pre>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="absolute right-2 top-2"
-                onClick={handleCopy}
-                aria-label="Code kopieren"
-              >
-                {copied ? <Check className="h-4 w-4 text-green-400" /> : <Copy className="h-4 w-4" />}
-              </Button>
+              <p className="text-xs text-muted-foreground">
+                Snippet in Webflow (Embed-Element), Slater oder direkt in dein HTML einfügen.
+              </p>
+            </div>
+            )}
+              </div>
             </div>
           </div>
+        </Tabs>
 
-          <div className="flex justify-end gap-2">
-            <Button variant="outline" onClick={() => onOpenChange(false)}>
-              Schließen
-            </Button>
-          </div>
-        </div>
+        <DialogFooter className="shrink-0 border-t px-6 py-4">
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            Schließen
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
