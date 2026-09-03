@@ -1,4 +1,6 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import { formatFromFileName } from './hdri/format';
+import type { EnvironmentFormat } from './hdri/types';
 
 export type Vec3 = [number, number, number];
 
@@ -44,7 +46,31 @@ export type EnvironmentConfig = {
   intensity: number;
   /** Optional background blur (0-1) when shown as background. */
   blurriness?: number;
+  /**
+   * Which decoder the blob needs. Absent on records written before the
+   * converter existed — derive it from `fileName` via `formatFromFileName`.
+   */
+  format?: EnvironmentFormat;
+  /** Byte length of the stored blob. Absent on older records. */
+  fileSize?: number;
+  /** Pixel dimensions of the stored image. Absent on older records. */
+  width?: number;
+  height?: number;
+  /** Name of the file the user picked, before conversion renamed it. */
+  sourceFileName?: string;
+  /** Id of the bundled HDRI this came from, if any. */
+  presetId?: string;
 };
+
+/**
+ * Which decoder a stored environment needs. Records written before the HDRI
+ * converter existed carry no `format`; their extensions are unambiguous
+ * (`.hdr`/`.exr`/`.png`/`.webp` — Ultra HDR did not exist yet), so deriving it
+ * from the file name is correct for them and no migration is needed.
+ */
+export function environmentFormat(env: EnvironmentConfig): EnvironmentFormat {
+  return env.format ?? formatFromFileName(env.fileName);
+}
 
 export type ModelEntry = {
   id: string;
@@ -70,6 +96,8 @@ export type SceneGroup = {
 };
 
 export type KeyframeData = {
+  /** Stable id. Absent in projects saved before keyframes became editable. */
+  id?: string;
   position: [number, number, number];
   lookAt: [number, number, number];
 };
@@ -135,4 +163,28 @@ export async function getDB(): Promise<IDBPDatabase<Web3DStudioDB>> {
 
 export function generateId(): string {
   return crypto.randomUUID();
+}
+
+/**
+ * Deletes blobs no longer referenced by any model record or project
+ * environment. Model and environment deletions intentionally leave their blob
+ * behind so an undo can restore them; this sweep is the deferred cleanup and
+ * runs on project load, which also heals orphans left by older versions.
+ */
+export async function sweepOrphanBlobs(): Promise<number> {
+  const db = await getDB();
+  const referenced = new Set<string>();
+
+  for (const model of await db.getAll('models')) referenced.add(model.id);
+  for (const project of await db.getAll('projects')) {
+    if (project.environment?.blobId) referenced.add(project.environment.blobId);
+  }
+
+  const orphans = (await db.getAllKeys('blobs')).filter((key) => !referenced.has(key));
+  if (!orphans.length) return 0;
+
+  const tx = db.transaction('blobs', 'readwrite');
+  for (const key of orphans) tx.objectStore('blobs').delete(key);
+  await tx.done;
+  return orphans.length;
 }

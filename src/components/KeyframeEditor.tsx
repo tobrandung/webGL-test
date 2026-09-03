@@ -1,28 +1,55 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import * as THREE from 'three';
-import { Play, Pause, Repeat, Repeat1, Plus, Trash2, Download, Upload } from 'lucide-react';
+import {
+  Play,
+  Pause,
+  Repeat,
+  Repeat1,
+  Plus,
+  Trash2,
+  Download,
+  Upload,
+  Camera,
+  SlidersHorizontal,
+  Eye,
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
-import { buildSplines, getSplinePoints, getCameraAtProgress, type Keyframe } from '@/three/camera-path';
+import { buildSplines, getCameraAtProgress, type Keyframe } from '@/three/camera-path';
 import type { ViewportContext } from '@/three/viewport';
+
+export type CameraPathImport = {
+  keyframes?: Array<{ position: [number, number, number]; lookAt: [number, number, number] }>;
+  isLoop?: boolean;
+  speed?: number;
+};
 
 type KeyframeEditorProps = {
   viewportCtx: ViewportContext | null;
   keyframes: Keyframe[];
   isLoop: boolean;
   speed: number;
-  onKeyframesChange: (keyframes: Keyframe[]) => void;
+  /** Id of the keyframe whose marker currently owns the gizmo. */
+  selectedKeyframeId: string | null;
+  showSpline: boolean;
+  showMarkers: boolean;
+  onToggleSpline: (visible: boolean) => void;
+  onToggleMarkers: (visible: boolean) => void;
+  onSelectKeyframe: (id: string | null) => void;
+  onAddKeyframe: () => void;
+  onJumpToKeyframe: (id: string) => void;
+  onDeleteKeyframe: (id: string) => void;
+  onReorderKeyframes: (orderedIds: string[]) => void;
   onLoopChange: (isLoop: boolean) => void;
   onSpeedChange: (speed: number) => void;
+  onImportPath: (data: CameraPathImport) => void;
 };
 
 export function KeyframeEditor({
@@ -30,80 +57,34 @@ export function KeyframeEditor({
   keyframes,
   isLoop,
   speed,
-  onKeyframesChange,
+  selectedKeyframeId,
+  showSpline,
+  showMarkers,
+  onToggleSpline,
+  onToggleMarkers,
+  onSelectKeyframe,
+  onAddKeyframe,
+  onJumpToKeyframe,
+  onDeleteKeyframe,
+  onReorderKeyframes,
   onLoopChange,
   onSpeedChange,
+  onImportPath,
 }: KeyframeEditorProps) {
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState([0]);
-  const [showSpline, setShowSpline] = useState(true);
-  const [showMarkers, setShowMarkers] = useState(true);
-  const splineLineRef = useRef<THREE.Line | null>(null);
-  const markersGroupRef = useRef<THREE.Group | null>(null);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
   const animFrameRef = useRef<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const stripRef = useRef<HTMLDivElement>(null);
+  /** Which edges of the keyframe strip still have content hidden behind them. */
+  const [overflow, setOverflow] = useState({ start: false, end: false });
 
+  // Marker and spline rendering is owned by the viewport (see
+  // `applyKeyframeMarkers`) so the gizmo keeps its target across edits; this
+  // panel only drives playback, scrubbing and the timeline strip.
   const splines = buildSplines(keyframes, isLoop);
-
-  useEffect(() => {
-    if (!viewportCtx) return;
-    updateVisualization();
-    return () => cleanupVisualization();
-  }, [viewportCtx, keyframes, isLoop, showSpline, showMarkers]);
-
-  function updateVisualization() {
-    if (!viewportCtx) return;
-    cleanupVisualization();
-
-    if (showSpline && splines.positionSpline) {
-      const points = getSplinePoints(splines.positionSpline);
-      const geometry = new THREE.BufferGeometry().setFromPoints(points);
-      const material = new THREE.LineBasicMaterial({ color: 0x00aaff, opacity: 0.7, transparent: true });
-      const line = new THREE.Line(geometry, material);
-      viewportCtx.scene.add(line);
-      splineLineRef.current = line;
-    }
-
-    if (showMarkers) {
-      const group = new THREE.Group();
-      keyframes.forEach((kf) => {
-        const sphereGeo = new THREE.SphereGeometry(0.08);
-        const sphereMat = new THREE.MeshBasicMaterial({ color: 0xff4444 });
-        const sphere = new THREE.Mesh(sphereGeo, sphereMat);
-        sphere.position.set(...kf.position);
-        group.add(sphere);
-
-        const lookAtGeo = new THREE.SphereGeometry(0.04);
-        const lookAtMat = new THREE.MeshBasicMaterial({ color: 0x44ff44 });
-        const lookAtSphere = new THREE.Mesh(lookAtGeo, lookAtMat);
-        lookAtSphere.position.set(...kf.lookAt);
-        group.add(lookAtSphere);
-
-        const lineGeo = new THREE.BufferGeometry().setFromPoints([
-          new THREE.Vector3(...kf.position),
-          new THREE.Vector3(...kf.lookAt),
-        ]);
-        const lineMat = new THREE.LineBasicMaterial({ color: 0xffff44, opacity: 0.4, transparent: true });
-        const connector = new THREE.Line(lineGeo, lineMat);
-        group.add(connector);
-      });
-      viewportCtx.scene.add(group);
-      markersGroupRef.current = group;
-    }
-  }
-
-  function cleanupVisualization() {
-    if (!viewportCtx) return;
-    if (splineLineRef.current) {
-      viewportCtx.scene.remove(splineLineRef.current);
-      splineLineRef.current.geometry.dispose();
-      splineLineRef.current = null;
-    }
-    if (markersGroupRef.current) {
-      viewportCtx.scene.remove(markersGroupRef.current);
-      markersGroupRef.current = null;
-    }
-  }
 
   useEffect(() => {
     if (!playing || !splines.positionSpline || !splines.lookAtSpline || !viewportCtx) return;
@@ -142,34 +123,39 @@ export function KeyframeEditor({
     return () => cancelAnimationFrame(animFrameRef.current);
   }, [playing, speed, isLoop, keyframes, viewportCtx]);
 
-  const addKeyframe = useCallback(() => {
-    if (!viewportCtx) return;
-    const pos = viewportCtx.camera.position;
-    const target = viewportCtx.orbitControls.target;
-    const newKf: Keyframe = {
-      position: [pos.x, pos.y, pos.z],
-      lookAt: [target.x, target.y, target.z],
-    };
-    onKeyframesChange([...keyframes, newKf]);
-  }, [viewportCtx, keyframes, onKeyframesChange]);
+  const syncOverflow = useCallback(() => {
+    const el = stripRef.current;
+    if (!el) return;
+    // 1px slack: fractional scroll offsets would otherwise keep a fade on forever.
+    const start = el.scrollLeft > 1;
+    const end = el.scrollLeft + el.clientWidth < el.scrollWidth - 1;
+    setOverflow((prev) => (prev.start === start && prev.end === end ? prev : { start, end }));
+  }, []);
 
-  const deleteKeyframe = useCallback(
-    (index: number) => {
-      onKeyframesChange(keyframes.filter((_, i) => i !== index));
-    },
-    [keyframes, onKeyframesChange],
-  );
+  useEffect(() => {
+    const el = stripRef.current;
+    if (!el) return;
+    syncOverflow();
+    const observer = new ResizeObserver(syncOverflow);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [syncOverflow, keyframes.length]);
 
-  const jumpToKeyframe = useCallback(
-    (index: number) => {
-      if (!viewportCtx) return;
-      const kf = keyframes[index];
-      viewportCtx.camera.position.set(...kf.position);
-      viewportCtx.orbitControls.target.set(...kf.lookAt);
-      viewportCtx.orbitControls.update();
-    },
-    [viewportCtx, keyframes],
-  );
+  // A keyframe can also be selected by clicking its marker in the viewport, which
+  // may sit far outside the visible part of a long strip.
+  useEffect(() => {
+    if (!selectedKeyframeId) return;
+    stripRef.current
+      ?.querySelector(`[data-kf-id="${selectedKeyframeId}"]`)
+      ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [selectedKeyframeId]);
+
+  // Fades the chips themselves rather than overlaying the panel colour, so the
+  // hint reads the same over any part of the 3D scene behind the bar.
+  const fadeMask = `linear-gradient(to right, ${[
+    overflow.start ? 'transparent 0px, #000 24px' : '#000 0px',
+    overflow.end ? '#000 calc(100% - 36px), transparent 100%' : '#000 100%',
+  ].join(', ')})`;
 
   const handleTimelineChange = useCallback(
     (value: number[]) => {
@@ -183,8 +169,27 @@ export function KeyframeEditor({
     [splines, viewportCtx],
   );
 
+  /** Moves the dragged keyframe in front of the drop target. */
+  const handleDrop = useCallback(
+    (targetId: string) => {
+      setDraggingId(null);
+      setDropTargetId(null);
+      if (!draggingId || draggingId === targetId) return;
+      const remaining = keyframes.map((kf) => kf.id).filter((id) => id !== draggingId);
+      const at = remaining.indexOf(targetId);
+      if (at < 0) return;
+      remaining.splice(at, 0, draggingId);
+      onReorderKeyframes(remaining);
+    },
+    [draggingId, keyframes, onReorderKeyframes],
+  );
+
   const exportJSON = useCallback(() => {
-    const data = JSON.stringify({ keyframes, isLoop, speed }, null, 2);
+    const data = JSON.stringify(
+      { keyframes: keyframes.map(({ position, lookAt }) => ({ position, lookAt })), isLoop, speed },
+      null,
+      2,
+    );
     const blob = new Blob([data], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -201,10 +206,7 @@ export function KeyframeEditor({
       const reader = new FileReader();
       reader.onload = () => {
         try {
-          const data = JSON.parse(reader.result as string);
-          if (data.keyframes) onKeyframesChange(data.keyframes);
-          if (typeof data.isLoop === 'boolean') onLoopChange(data.isLoop);
-          if (typeof data.speed === 'number') onSpeedChange(data.speed);
+          onImportPath(JSON.parse(reader.result as string) as CameraPathImport);
         } catch {
           /* invalid JSON */
         }
@@ -212,7 +214,7 @@ export function KeyframeEditor({
       reader.readAsText(file);
       e.target.value = '';
     },
-    [onKeyframesChange, onLoopChange, onSpeedChange],
+    [onImportPath],
   );
 
   return (
@@ -257,11 +259,13 @@ export function KeyframeEditor({
 
         <Tooltip>
           <TooltipTrigger asChild>
-            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={addKeyframe} aria-label="Keyframe hinzufügen">
+            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={onAddKeyframe} aria-label="Keyframe hinzufügen">
               <Plus className="h-4 w-4" />
             </Button>
           </TooltipTrigger>
-          <TooltipContent>Keyframe hinzufügen</TooltipContent>
+          <TooltipContent>
+            {selectedKeyframeId ? 'Keyframe hinter dem gewählten einfügen' : 'Keyframe hinzufügen'}
+          </TooltipContent>
         </Tooltip>
 
         <Tooltip>
@@ -287,48 +291,143 @@ export function KeyframeEditor({
       <Separator />
 
       <div className="flex items-center gap-3 px-3 py-1.5">
-        <div className="flex items-center gap-1.5">
-          <Switch id="show-spline" checked={showSpline} onCheckedChange={setShowSpline} />
-          <Label htmlFor="show-spline" className="text-xs">Spline</Label>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <Switch id="show-markers" checked={showMarkers} onCheckedChange={setShowMarkers} />
-          <Label htmlFor="show-markers" className="text-xs">Marker</Label>
+        <div className="flex shrink-0 items-center gap-2.5">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Eye className="h-3.5 w-3.5" />
+                Anzeigen
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>Sichtbarkeit der Pfad-Hilfsobjekte im Viewport</TooltipContent>
+          </Tooltip>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div className="flex items-center gap-1.5">
+                <Switch id="show-spline" checked={showSpline} onCheckedChange={onToggleSpline} />
+                <Label htmlFor="show-spline" className="text-xs">Spline</Label>
+              </div>
+            </TooltipTrigger>
+            <TooltipContent>Kurve der Kamerafahrt ein-/ausblenden</TooltipContent>
+          </Tooltip>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div className="flex items-center gap-1.5">
+                <Switch id="show-markers" checked={showMarkers} onCheckedChange={onToggleMarkers} />
+                <Label htmlFor="show-markers" className="text-xs">Marker</Label>
+              </div>
+            </TooltipTrigger>
+            <TooltipContent>Keyframe-Punkte ein-/ausblenden (rot: Kamera, grün: Blickpunkt)</TooltipContent>
+          </Tooltip>
         </div>
 
         <Separator orientation="vertical" className="h-5" />
 
-        <ScrollArea className="flex-1">
-          <div className="flex gap-1.5">
-            {keyframes.map((kf, i) => (
-              <div
-                key={i}
-                className="flex shrink-0 items-center gap-1 rounded-md bg-secondary px-2 py-1"
-              >
-                <button
-                  className="text-xs font-medium hover:text-primary"
-                  onClick={() => jumpToKeyframe(i)}
-                  type="button"
+        <span className="shrink-0 text-xs text-muted-foreground">Keyframes</span>
+
+        <div className="min-w-0 flex-1">
+          <div
+            ref={stripRef}
+            onScroll={syncOverflow}
+            className="no-scrollbar flex gap-1.5 overflow-x-auto"
+            style={{ maskImage: fadeMask, WebkitMaskImage: fadeMask }}
+          >
+            {keyframes.map((kf, i) => {
+              const isSelected = selectedKeyframeId === kf.id;
+              return (
+                <div
+                  key={kf.id}
+                  data-kf-id={kf.id}
+                  draggable
+                  onDragStart={() => setDraggingId(kf.id)}
+                  onDragEnd={() => {
+                    setDraggingId(null);
+                    setDropTargetId(null);
+                  }}
+                  onDragOver={(e) => {
+                    if (!draggingId || draggingId === kf.id) return;
+                    e.preventDefault();
+                    setDropTargetId(kf.id);
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    handleDrop(kf.id);
+                  }}
+                  onClick={() => onSelectKeyframe(isSelected ? null : kf.id)}
+                  onDoubleClick={() => onJumpToKeyframe(kf.id)}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') onSelectKeyframe(kf.id);
+                  }}
+                  title="Klick: auswählen · Doppelklick: Kamera hierher · Ziehen: umsortieren"
+                  className={`group flex shrink-0 cursor-grab items-center gap-1 rounded-md px-2 py-1 ${
+                    dropTargetId === kf.id ? 'border-l-2 border-ring' : ''
+                  } ${
+                    isSelected ? 'bg-accent text-accent-foreground ring-1 ring-ring' : 'bg-secondary'
+                  } ${draggingId === kf.id ? 'opacity-40' : ''}`}
                 >
-                  KF {i + 1}
-                </button>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button
-                      className="text-muted-foreground hover:text-red-400"
-                      onClick={() => deleteKeyframe(i)}
-                      type="button"
-                      aria-label={`Keyframe ${i + 1} löschen`}
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent>Keyframe löschen</TooltipContent>
-                </Tooltip>
-              </div>
-            ))}
+                  <span className="min-w-3 text-center text-xs font-medium tabular-nums">{i + 1}</span>
+
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        className="text-muted-foreground/70 transition-colors hover:text-foreground"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onJumpToKeyframe(kf.id);
+                        }}
+                        type="button"
+                        aria-label={`Kamera zu Keyframe ${i + 1}`}
+                      >
+                        <Camera className="h-3 w-3" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Ansicht dieses Keyframes einnehmen</TooltipContent>
+                  </Tooltip>
+
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        className="text-muted-foreground/70 transition-colors hover:text-foreground"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          // Selecting is what reveals the keyframe in the
+                          // properties panel on the right.
+                          onSelectKeyframe(kf.id);
+                        }}
+                        type="button"
+                        aria-label={`Einstellungen von Keyframe ${i + 1}`}
+                      >
+                        <SlidersHorizontal className="h-3 w-3" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Weitere Optionen im Eigenschaften-Panel</TooltipContent>
+                  </Tooltip>
+
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        className="text-muted-foreground/70 transition-colors hover:text-red-400"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onDeleteKeyframe(kf.id);
+                        }}
+                        type="button"
+                        aria-label={`Keyframe ${i + 1} löschen`}
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Keyframe löschen</TooltipContent>
+                  </Tooltip>
+                </div>
+              );
+            })}
           </div>
-        </ScrollArea>
+        </div>
       </div>
     </div>
   );

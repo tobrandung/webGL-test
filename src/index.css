@@ -120,6 +120,15 @@
   --color-sidebar-ring: var(--sidebar-ring);
 }
 
+/* Scrollen ohne sichtbare Scrollbar (z. B. Keyframe-Leiste, die stattdessen
+   einen Rand-Fade als Hinweis nutzt). */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

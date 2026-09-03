@@ -9,6 +9,7 @@ import {
   type LightRecord,
 } from '@/three/lighting';
 import type { LightEntry } from '@/lib/db';
+import type { EnvironmentFormat } from '@/lib/hdri/types';
 
 type Vec3 = [number, number, number];
 
@@ -24,6 +25,12 @@ type ModelConfig = {
 
 type EnvironmentWidgetConfig = {
   url: string;
+  /**
+   * Decoder to use. Additive: embed snippets generated before Ultra HDR
+   * existed omit it and fall back to sniffing the URL's extension, which is
+   * correct for every format that was exportable back then.
+   */
+  format?: EnvironmentFormat;
   showBackground: boolean;
   useForReflection: boolean;
   intensity: number;
@@ -124,7 +131,7 @@ function init(selector: string, config: WidgetConfig) {
 
   if (config.environment) {
     const env = config.environment;
-    loadEquirectTexture(env.url, env.url)
+    loadEquirectTexture(env.url, env.url, env.format)
       .then((texture) => {
         applyEnvironment(scene, renderer, texture, {
           showBackground: env.showBackground,

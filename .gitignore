@@ -2,3 +2,8 @@ node_modules
 dist
 .DS_Store
 *.local
+
+# HDRI-Quelldateien: 404 MB unkomprimierte 4K-EXRs, aus denen
+# `npm run presets:hdri` die Presets in public/hdri/ erzeugt. Die Ergebnisse
+# sind versioniert, die Quellen bleiben lokal.
+assets/example-hdris/

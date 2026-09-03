@@ -12,6 +12,11 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
+    // Coupled to `noEmit`: the pure modules in src/lib/hdri import each other
+    // with explicit `.ts` specifiers so that scripts/convert-hdri.ts can run the
+    // very same files under Node (native type stripping requires the extension).
+    // Removing `noEmit` makes tsc reject every one of those imports.
+    "allowImportingTsExtensions": true,
     "jsx": "react-jsx",
     "paths": {
       "@/*": ["./src/*"]

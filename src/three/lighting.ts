@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import { formatFromFileName } from '@/lib/hdri/format';
+import type { EnvironmentFormat } from '@/lib/hdri/types';
 import type { LightEntry, LightType } from '@/lib/db';
 
 /**
@@ -230,23 +232,41 @@ export function syncLights(
 }
 
 /**
- * Loads an equirectangular image (`.hdr`/`.exr`/LDR) as a texture ready for use
- * as `scene.environment`/`scene.background`. Blobs are loaded via object URL,
- * which is revoked once the loader has consumed it. Heavy HDR/EXR loaders are
+ * Loads an equirectangular image as a texture ready for use as
+ * `scene.environment`/`scene.background`. Blobs are loaded via object URL,
+ * which is revoked once the loader has consumed it. The heavy decoders are
  * imported lazily so they only ship when actually needed.
+ *
+ * `format` decides the decoder and should be passed whenever it is known: an
+ * Ultra HDR file is a `.jpg`, and handing that to `TextureLoader` *succeeds* —
+ * it decodes only the SDR base layer and silently drops the gain map, leaving a
+ * flat, dim environment with no error anywhere. Omitting it falls back to name
+ * sniffing, which is what environments stored before the converter existed rely
+ * on (their extensions are unambiguous, so it is correct for them).
  */
-export async function loadEquirectTexture(source: Blob | string, fileName: string): Promise<THREE.Texture> {
+export async function loadEquirectTexture(
+  source: Blob | string,
+  fileName: string,
+  format?: EnvironmentFormat,
+): Promise<THREE.Texture> {
   const url = typeof source === 'string' ? source : URL.createObjectURL(source);
-  const ext = fileName.toLowerCase().slice(fileName.lastIndexOf('.'));
+  const kind = format ?? formatFromFileName(fileName);
 
   try {
     let texture: THREE.Texture;
-    if (ext === '.hdr') {
-      const { RGBELoader } = await import('three/addons/loaders/RGBELoader.js');
-      texture = await new RGBELoader().loadAsync(url);
-    } else if (ext === '.exr') {
+    if (kind === 'hdr') {
+      // HDRLoader, not RGBELoader: the latter is a deprecation shim in r180+
+      // that logs a warning on every construction.
+      const { HDRLoader } = await import('three/addons/loaders/HDRLoader.js');
+      texture = await new HDRLoader().loadAsync(url);
+    } else if (kind === 'exr') {
       const { EXRLoader } = await import('three/addons/loaders/EXRLoader.js');
       texture = await new EXRLoader().loadAsync(url);
+    } else if (kind === 'ultrahdr') {
+      const { UltraHDRLoader } = await import('three/addons/loaders/UltraHDRLoader.js');
+      // No colorSpace assignment here: the loader reconstructs linear HDR data
+      // from the gain map, so tagging it sRGB would double-decode the transfer.
+      texture = await new UltraHDRLoader().loadAsync(url);
     } else {
       texture = await new THREE.TextureLoader().loadAsync(url);
       texture.colorSpace = THREE.SRGBColorSpace;
