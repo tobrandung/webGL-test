@@ -18,3 +18,14 @@ export function slugify(value: string): string {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'projekt';
 }
+
+/**
+ * Human-readable byte count with a German decimal comma. Centralises the
+ * `(x / (1024 * 1024)).toFixed(2)` that was inlined in both upload dialogs.
+ */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '–';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024).toLocaleString('de-DE')} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 2 : 1).replace('.', ',')} MB`;
+}

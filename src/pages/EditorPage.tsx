@@ -1,9 +1,11 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import * as THREE from 'three';
 import {
   getDB,
   generateId,
+  sweepOrphanBlobs,
+  environmentFormat,
   type Project,
   type ModelEntry,
   type SceneGroup,
@@ -12,7 +14,7 @@ import {
   type EnvironmentConfig,
 } from '@/lib/db';
 import { useModels } from '@/hooks/useModels';
-import { useHistory, type Command } from '@/hooks/useHistory';
+import { useHistory, stateCommand, type Command } from '@/hooks/useHistory';
 import {
   createViewport,
   loadModelFromBuffer,
@@ -20,18 +22,23 @@ import {
   setTransformMode,
   removeModel,
   applyViewportLights,
+  applyKeyframeMarkers,
   setViewportEnvironment,
   updateBackground,
   captureThumbnail,
   type ViewportContext,
   type TransformMode,
 } from '@/three/viewport';
+import { pickableKeyframeMarkers, findKeyframeMarker } from '@/three/keyframe-markers';
 import { createDefaultLights, createLightEntry, loadEquirectTexture } from '@/three/lighting';
 import { EditorToolbar } from '@/components/EditorToolbar';
 import { ModelUploadDialog } from '@/components/ModelUploadDialog';
-import { EnvironmentUploadDialog } from '@/components/EnvironmentUploadDialog';
-import { PropertiesPanel } from '@/components/PropertiesPanel';
-import { KeyframeEditor } from '@/components/KeyframeEditor';
+import {
+  EnvironmentUploadDialog,
+  type EnvironmentUploadResult,
+} from '@/components/EnvironmentUploadDialog';
+import { PropertiesPanel, type KeyframeSelection } from '@/components/PropertiesPanel';
+import { KeyframeEditor, type CameraPathImport } from '@/components/KeyframeEditor';
 import { ExportDialog } from '@/components/ExportDialog';
 import { SceneOutliner, type OutlinerSelectionKind } from '@/components/SceneOutliner';
 import {
@@ -45,7 +52,61 @@ import {
   AlertDialogCancel,
 } from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
-import type { Keyframe } from '@/three/camera-path';
+import {
+  formatKeyframeRef,
+  parseKeyframeRef,
+  type Keyframe,
+  type KeyframePart,
+} from '@/three/camera-path';
+
+type Transform = {
+  position: [number, number, number];
+  rotation: [number, number, number];
+  scale: [number, number, number];
+};
+
+/** Snapshot taken when a gizmo drag starts, committed to history when it ends. */
+type DragSnapshot =
+  | { kind: 'model'; id: string; transform: Transform }
+  | { kind: 'light'; lights: LightEntry[] }
+  | { kind: 'keyframe'; keyframes: Keyframe[] };
+
+type CameraPathSnapshot = { keyframes: Keyframe[]; isLoop: boolean; speed: number };
+
+type OutlinerSnapshot = {
+  groups: SceneGroup[];
+  placement: { id: string; order: number; groupId: string | null }[];
+};
+
+const TRANSFORM_LABEL: Record<TransformMode, string> = {
+  translate: 'Verschieben',
+  rotate: 'Rotieren',
+  scale: 'Skalieren',
+};
+
+/** Clicks landing this soon after a gizmo drag are the drag's own mouse-up. */
+const CLICK_AFTER_DRAG_MS = 200;
+
+function readTransform(object: THREE.Object3D): Transform {
+  return {
+    position: [object.position.x, object.position.y, object.position.z],
+    rotation: [object.rotation.x, object.rotation.y, object.rotation.z],
+    scale: [object.scale.x, object.scale.y, object.scale.z],
+  };
+}
+
+function writeTransform(object: THREE.Object3D | undefined, transform: Transform) {
+  if (!object) return;
+  object.position.set(...transform.position);
+  object.rotation.set(...transform.rotation);
+  object.scale.set(...transform.scale);
+}
+
+function sameTransform(a: Transform, b: Transform): boolean {
+  return (['position', 'rotation', 'scale'] as const).every((key) =>
+    a[key].every((value, index) => value === b[key][index]),
+  );
+}
 
 export function EditorPage() {
   const { id } = useParams<{ id: string }>();
@@ -64,6 +125,8 @@ export function EditorPage() {
   const [keyframes, setKeyframes] = useState<Keyframe[]>([]);
   const [isLoop, setIsLoop] = useState(true);
   const [cameraSpeed, setCameraSpeed] = useState(1);
+  const [showSpline, setShowSpline] = useState(true);
+  const [showMarkers, setShowMarkers] = useState(true);
   const [isDirty, setIsDirty] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'dirty'>('saved');
   const [outlinerCollapsed, setOutlinerCollapsed] = useState(false);
@@ -87,17 +150,50 @@ export function EditorPage() {
   const selectionRef = useRef<{ id: string | null; kind: OutlinerSelectionKind | null }>({ id: null, kind: null });
 
   const history = useHistory();
-  const { models, addModel, updateModel, deleteModel, getModelBlob, reorderModels } = useModels(id ?? '');
+  const {
+    models,
+    addModel,
+    updateModel,
+    deleteModel,
+    restoreModel,
+    getModelBlob,
+    reorderModels,
+  } = useModels(id ?? '');
+
+  // Mirrors of the editable state, so history commands and the viewport event
+  // listeners (which are set up once per viewport) always read current values
+  // without re-subscribing or capturing stale closures.
+  const keyframesRef = useRef(keyframes);
+  const lightsRef = useRef(lights);
+  const groupsRef = useRef(groups);
+  const modelsRef = useRef(models);
+  const environmentRef = useRef(environment);
+  const backgroundRef = useRef(background);
+  const transparentRef = useRef(false);
+  useEffect(() => { keyframesRef.current = keyframes; }, [keyframes]);
+  useEffect(() => { lightsRef.current = lights; }, [lights]);
+  useEffect(() => { groupsRef.current = groups; }, [groups]);
+  useEffect(() => { modelsRef.current = models; }, [models]);
+  useEffect(() => { environmentRef.current = environment; }, [environment]);
+  useEffect(() => { backgroundRef.current = background; }, [background]);
+  useEffect(() => { transparentRef.current = project?.settings.transparent ?? false; }, [project]);
+
+  const dragSnapshotRef = useRef<DragSnapshot | null>(null);
+  const lastDragEndRef = useRef(0);
+  const commitDragRef = useRef<((snapshot: DragSnapshot, mode: TransformMode) => void) | null>(null);
 
   // Load project
   useEffect(() => {
     if (!id) { navigate('/'); return; }
+    history.clear();
     (async () => {
       const db = await getDB();
       const p = await db.get('projects', id);
       if (!p) { navigate('/'); return; }
       setProject(p);
-      setKeyframes(p.cameraPath.keyframes);
+      // Older projects stored keyframes without an id. Assign one so every
+      // keyframe is individually addressable; persisted lazily on first edit.
+      setKeyframes(p.cameraPath.keyframes.map((kf) => ({ ...kf, id: kf.id ?? generateId() })));
       setIsLoop(p.cameraPath.isLoop);
       setCameraSpeed(p.cameraPath.speed);
       setGroups(p.groups ?? []);
@@ -106,8 +202,11 @@ export function EditorPage() {
       setLights(p.lights && p.lights.length ? p.lights : createDefaultLights());
       setEnvironment(p.environment ?? null);
       setBackground(p.settings.background);
+      // Deletions keep their blob around so undo can restore them; collect the
+      // ones no longer reachable from any project.
+      await sweepOrphanBlobs().catch(() => {});
     })();
-  }, [id, navigate]);
+  }, [id, navigate, history.clear]);
 
   // Init viewport
   useEffect(() => {
@@ -117,8 +216,8 @@ export function EditorPage() {
     setViewport(ctx);
 
     ctx.transformControls.addEventListener('objectChange', () => {
-      // Read back a dragged light's position from the THREE object into state
-      // so the properties panel and persistence stay in sync.
+      // Read a dragged light's or keyframe marker's position back out of the
+      // THREE object into state so panels and persistence stay in sync.
       const sel = selectionRef.current;
       if (sel.kind === 'light' && sel.id) {
         const record = ctx.lights.get(sel.id);
@@ -128,8 +227,46 @@ export function EditorPage() {
             prev.map((l) => (l.id === sel.id ? { ...l, position: [p.x, p.y, p.z] } : l)),
           );
         }
+      } else if (sel.kind === 'keyframe' && sel.id) {
+        const parsed = parseKeyframeRef(sel.id);
+        const marker = parsed ? findKeyframeMarker(ctx.keyframeMarkers, sel.id) : null;
+        if (parsed && marker) {
+          const p = marker.position;
+          setKeyframes((prev) =>
+            prev.map((kf) =>
+              kf.id === parsed.id ? { ...kf, [parsed.part]: [p.x, p.y, p.z] as [number, number, number] } : kf,
+            ),
+          );
+        }
       }
       markDirty();
+    });
+
+    // Bracket each gizmo drag with a before/after snapshot so a transform is a
+    // single undo step — without this the drag only marked the project dirty
+    // and undo fell through to whatever command came before it.
+    ctx.transformControls.addEventListener('dragging-changed', (event) => {
+      const sel = selectionRef.current;
+      if (event.value) {
+        if (sel.kind === 'model' && sel.id) {
+          const group = ctx.models.get(sel.id);
+          dragSnapshotRef.current = group
+            ? { kind: 'model', id: sel.id, transform: readTransform(group) }
+            : null;
+        } else if (sel.kind === 'light') {
+          dragSnapshotRef.current = { kind: 'light', lights: lightsRef.current };
+        } else if (sel.kind === 'keyframe') {
+          dragSnapshotRef.current = { kind: 'keyframe', keyframes: keyframesRef.current };
+        } else {
+          dragSnapshotRef.current = null;
+        }
+        return;
+      }
+
+      lastDragEndRef.current = performance.now();
+      const snapshot = dragSnapshotRef.current;
+      dragSnapshotRef.current = null;
+      if (snapshot) commitDragRef.current?.(snapshot, ctx.transformControls.mode as TransformMode);
     });
 
     return () => {
@@ -145,52 +282,79 @@ export function EditorPage() {
     applyViewportLights(viewport, lights);
   }, [lights, viewport]);
 
+  // Camera-path markers and spline. Owned here (not by the keyframe panel) so
+  // the meshes are reconciled in place and the gizmo keeps its target; the path
+  // is only pickable while the camera-path editor is open.
+  useEffect(() => {
+    if (!viewport) return;
+    applyKeyframeMarkers(viewport, keyframes, {
+      showMarkers: showKeyframeEditor && showMarkers,
+      showSpline: showKeyframeEditor && showSpline,
+      isLoop,
+      selectedRef: selectedKind === 'keyframe' ? selectedId : null,
+    });
+  }, [viewport, keyframes, isLoop, showKeyframeEditor, showMarkers, showSpline, selectedId, selectedKind]);
+
+  // Re-attach the gizmo once a freshly created marker mesh exists (selecting a
+  // just-added keyframe runs before the sync effect has built its marker).
+  useEffect(() => {
+    if (!viewport || selectedKind !== 'keyframe' || !selectedId) return;
+    const marker = findKeyframeMarker(viewport.keyframeMarkers, selectedId);
+    // Skip while it is already attached — re-attaching on every drag frame
+    // would be pure churn.
+    if (!marker || viewport.transformControls.object === marker) return;
+    selectObject(viewport, selectedId, 'keyframe');
+  }, [viewport, selectedId, selectedKind, keyframes]);
+
   // Apply the solid background colour. A visible environment dome owns
   // `scene.background`, so skip while one is shown (the environment effect below
   // restores the solid colour when the dome is turned off).
   useEffect(() => {
     if (!viewport || environment?.showBackground) return;
-    updateBackground(viewport, background, project?.settings.transparent ?? false);
-  }, [background, viewport, project, environment]);
+    updateBackground(viewport, background, transparentRef.current);
+  }, [background, viewport, environment?.showBackground]);
 
-  // Mirror the latest background colour into a ref so the async environment
-  // effect can restore it without re-running when only the colour changes.
-  const backgroundRef = useRef(background);
-  useEffect(() => {
-    backgroundRef.current = background;
-  }, [background]);
-
-  // Load + apply the environment texture whenever the config or instance changes.
+  // Load + apply the environment texture. Deliberately keyed on the image
+  // identity and the two structural toggles rather than on `environment` as a
+  // whole: `handleUpdateEnvironment` produces a new object per patch, so
+  // depending on it re-read the blob from IndexedDB and re-ran PMREM on every
+  // slider tick — 100-400 ms each with a 4K HDRI. Intensity and blurriness are
+  // pure scene scalars and are handled by the effect below instead.
   useEffect(() => {
     const ctx = viewport;
     if (!ctx) return;
     let cancelled = false;
 
-    const transparent = project?.settings.transparent ?? false;
+    const transparent = transparentRef.current;
 
     (async () => {
-      if (!environment) {
+      const config = environmentRef.current;
+      if (!config) {
         setViewportEnvironment(ctx, null, { showBackground: false, useForReflection: false, intensity: 1 });
         updateBackground(ctx, backgroundRef.current, transparent);
         return;
       }
       const db = await getDB();
-      const blob = await db.get('blobs', environment.blobId);
+      const blob = await db.get('blobs', config.blobId);
       if (!blob || cancelled) return;
-      const texture = await loadEquirectTexture(new Blob([blob.data]), environment.fileName);
+      const texture = await loadEquirectTexture(
+        new Blob([blob.data]),
+        config.fileName,
+        environmentFormat(config),
+      );
       if (cancelled) {
         texture.dispose();
         return;
       }
       setViewportEnvironment(ctx, texture, {
-        showBackground: environment.showBackground,
-        useForReflection: environment.useForReflection,
-        intensity: environment.intensity,
-        blurriness: environment.blurriness,
+        showBackground: config.showBackground,
+        useForReflection: config.useForReflection,
+        intensity: config.intensity,
+        blurriness: config.blurriness,
       });
       // The dome owns scene.background only while shown; otherwise restore the
       // solid colour the environment application may have cleared.
-      if (!environment.showBackground) {
+      if (!config.showBackground) {
         updateBackground(ctx, backgroundRef.current, transparent);
       }
     })();
@@ -198,7 +362,25 @@ export function EditorPage() {
     return () => {
       cancelled = true;
     };
-  }, [environment, viewport, project]);
+  }, [
+    viewport,
+    environment?.blobId,
+    environment?.format,
+    environment?.showBackground,
+    environment?.useForReflection,
+  ]);
+
+  // Intensity and blurriness are plain scene scalars, so a drag on either
+  // slider must not trigger the decode + PMREM above.
+  useEffect(() => {
+    if (!viewport || !environment) return;
+    const { scene } = viewport;
+    if (environment.useForReflection) scene.environmentIntensity = environment.intensity;
+    if (environment.showBackground) {
+      scene.backgroundIntensity = environment.intensity;
+      scene.backgroundBlurriness = environment.blurriness ?? 0;
+    }
+  }, [viewport, environment]);
 
   // Load models into the viewport. Keyed on the `viewport` instance so models
   // fetched from IndexedDB before the viewport exists (or after it is recreated)
@@ -241,6 +423,229 @@ export function EditorPage() {
     }, 3000);
   }, []);
 
+  // ---------------------------------------------------------------------------
+  // History plumbing
+  // ---------------------------------------------------------------------------
+
+  /** Runs a command and records it. */
+  const runCommand = useCallback(
+    (command: Command) => {
+      history.execute(command);
+      markDirty();
+    },
+    [history, markDirty],
+  );
+
+  /** Records a command whose effect already happened. */
+  const pushCommand = useCallback(
+    (command: Command) => {
+      history.push(command);
+      markDirty();
+    },
+    [history, markDirty],
+  );
+
+  const handleUndo = useCallback(() => {
+    history.undo();
+    markDirty();
+  }, [history, markDirty]);
+
+  const handleRedo = useCallback(() => {
+    history.redo();
+    markDirty();
+  }, [history, markDirty]);
+
+  const applyCameraPath = useCallback((snapshot: CameraPathSnapshot) => {
+    setKeyframes(snapshot.keyframes);
+    setIsLoop(snapshot.isLoop);
+    setCameraSpeed(snapshot.speed);
+  }, []);
+
+  const captureCameraPath = useCallback(
+    (): CameraPathSnapshot => ({
+      keyframes: keyframesRef.current,
+      isLoop: isLoop,
+      speed: cameraSpeed,
+    }),
+    [isLoop, cameraSpeed],
+  );
+
+  /** Undoable replacement of the keyframe list. */
+  const commitKeyframes = useCallback(
+    (type: string, label: string, next: Keyframe[], mergeKey?: string) => {
+      runCommand(
+        stateCommand({
+          type,
+          label,
+          before: keyframesRef.current,
+          after: next,
+          apply: setKeyframes,
+          mergeKey,
+        }),
+      );
+    },
+    [runCommand],
+  );
+
+  /** Undoable replacement of the light list. */
+  const commitLights = useCallback(
+    (type: string, label: string, next: LightEntry[], mergeKey?: string) => {
+      runCommand(
+        stateCommand({
+          type,
+          label,
+          before: lightsRef.current,
+          after: next,
+          apply: setLights,
+          mergeKey,
+        }),
+      );
+    },
+    [runCommand],
+  );
+
+  const applyOutliner = useCallback(
+    (snapshot: OutlinerSnapshot) => {
+      setGroups(snapshot.groups);
+      void reorderModels(snapshot.placement);
+    },
+    [reorderModels],
+  );
+
+  const captureOutliner = useCallback(
+    (): OutlinerSnapshot => ({
+      groups: groupsRef.current,
+      placement: modelsRef.current.map((m, index) => ({
+        id: m.id,
+        order: m.order ?? index,
+        groupId: m.groupId ?? null,
+      })),
+    }),
+    [],
+  );
+
+  /** The model record plus its live viewport transform (which may be newer). */
+  const captureModelEntry = useCallback((modelId: string): ModelEntry | null => {
+    const base = modelsRef.current.find((m) => m.id === modelId);
+    if (!base) return null;
+    const group = viewportRef.current?.models.get(modelId);
+    if (!group) return base;
+    const transform = readTransform(group);
+    return { ...base, ...transform };
+  }, []);
+
+  const applySelection = useCallback((nextId: string | null, kind: OutlinerSelectionKind | null) => {
+    const ctx = viewportRef.current;
+    selectionRef.current = { id: nextId, kind };
+    setSelectedId(nextId);
+    setSelectedKind(kind);
+    if (!ctx) return;
+    if (kind === 'model' || kind === 'light' || kind === 'keyframe') {
+      selectObject(ctx, nextId, kind);
+    } else {
+      // environment, world or cleared selection: no gizmo
+      selectObject(ctx, null, null);
+    }
+  }, []);
+
+  /** Adds a model to history so undo removes it and redo brings it back. */
+  const makeModelAddCommand = useCallback(
+    (entry: ModelEntry, label: string): Command => {
+      let snapshot = entry;
+      return {
+        type: 'model:add',
+        label,
+        execute: () => {
+          void restoreModel(snapshot);
+        },
+        undo: () => {
+          // Re-capture first: name, group and transform may have changed since
+          // the model was added, and a redo should bring back the latest state.
+          snapshot = captureModelEntry(snapshot.id) ?? snapshot;
+          const ctx = viewportRef.current;
+          if (ctx) removeModel(ctx, snapshot.id);
+          void deleteModel(snapshot.id);
+          if (selectionRef.current.id === snapshot.id) applySelection(null, null);
+        },
+      };
+    },
+    [restoreModel, deleteModel, captureModelEntry, applySelection],
+  );
+
+  const deleteModelWithHistory = useCallback(
+    (modelId: string) => {
+      const snapshot = captureModelEntry(modelId);
+      if (!snapshot) return;
+      runCommand({
+        type: 'model:delete',
+        label: `"${snapshot.name}" löschen`,
+        execute: () => {
+          const ctx = viewportRef.current;
+          if (ctx) removeModel(ctx, snapshot.id);
+          void deleteModel(snapshot.id);
+          if (selectionRef.current.id === snapshot.id) applySelection(null, null);
+        },
+        undo: () => {
+          void restoreModel(snapshot);
+        },
+      });
+    },
+    [captureModelEntry, runCommand, deleteModel, restoreModel, applySelection],
+  );
+
+  const commitDrag = useCallback(
+    (snapshot: DragSnapshot, mode: TransformMode) => {
+      if (snapshot.kind === 'model') {
+        const group = viewportRef.current?.models.get(snapshot.id);
+        if (!group) return;
+        const after = readTransform(group);
+        if (sameTransform(snapshot.transform, after)) return;
+        const before = snapshot.transform;
+        const modelId = snapshot.id;
+        const name = modelsRef.current.find((m) => m.id === modelId)?.name;
+        pushCommand({
+          type: `transform:model:${mode}`,
+          label: name ? `${TRANSFORM_LABEL[mode]}: "${name}"` : TRANSFORM_LABEL[mode],
+          execute: () => writeTransform(viewportRef.current?.models.get(modelId), after),
+          undo: () => writeTransform(viewportRef.current?.models.get(modelId), before),
+        });
+        return;
+      }
+
+      if (snapshot.kind === 'light') {
+        // The objectChange handler only replaces the array when a value moved,
+        // so identity is a reliable "nothing changed" test.
+        if (lightsRef.current === snapshot.lights) return;
+        pushCommand(
+          stateCommand({
+            type: 'transform:light',
+            label: 'Licht verschieben',
+            before: snapshot.lights,
+            after: lightsRef.current,
+            apply: setLights,
+          }),
+        );
+        return;
+      }
+
+      if (keyframesRef.current === snapshot.keyframes) return;
+      pushCommand(
+        stateCommand({
+          type: 'transform:keyframe',
+          label: 'Keyframe verschieben',
+          before: snapshot.keyframes,
+          after: keyframesRef.current,
+          apply: setKeyframes,
+        }),
+      );
+    },
+    [pushCommand],
+  );
+
+  useEffect(() => {
+    commitDragRef.current = commitDrag;
+  }, [commitDrag]);
+
   const performSave = useCallback(async () => {
     if (!id || !project) return;
     setSaveStatus('saving');
@@ -272,7 +677,8 @@ export function EditorPage() {
     // Capture a fresh viewport thumbnail (falls back to the existing one).
     // Not written back into `project` state to avoid re-triggering the
     // viewport-init effect (which keys on the `project` reference) on every save.
-    const thumbnail = ctx ? captureThumbnail(ctx) : project.thumbnail;
+    // An empty capture means the viewport could not be read; keep the old one.
+    const thumbnail = (ctx && captureThumbnail(ctx)) || project.thumbnail;
 
     // Save camera path + outliner groups + lights + environment
     await db.put('projects', {
@@ -314,153 +720,53 @@ export function EditorPage() {
     navigate('/');
   }, [navigate]);
 
-  // Keyboard shortcuts
-  useEffect(() => {
-    function handleKeyDown(e: KeyboardEvent) {
-      const ctx = viewportRef.current;
-      if (!ctx) return;
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+  // ---------------------------------------------------------------------------
+  // Models
+  // ---------------------------------------------------------------------------
 
-      const isMeta = e.metaKey || e.ctrlKey;
+  const handleUpload = useCallback(
+    async (file: File) => {
+      const newModel = await addModel(file);
+      // The record already exists, so only record it — executing again would
+      // duplicate the write.
+      pushCommand(makeModelAddCommand(newModel, `"${newModel.name}" hinzufügen`));
+    },
+    [addModel, makeModelAddCommand, pushCommand],
+  );
 
-      // Undo/Redo
-      if (isMeta && e.key === 'z' && !e.shiftKey) {
-        e.preventDefault();
-        history.undo();
-        return;
-      }
-      if (isMeta && e.key === 'z' && e.shiftKey) {
-        e.preventDefault();
-        history.redo();
-        return;
-      }
-
-      // Copy
-      if (isMeta && e.key === 'c') {
-        if (selectedId) {
-          const model = models.find((m) => m.id === selectedId);
-          if (model) {
-            clipboardRef.current = { model, blobId: model.id };
-          }
-        }
-        return;
-      }
-
-      // Paste
-      if (isMeta && e.key === 'v') {
-        e.preventDefault();
-        pasteModel();
-        return;
-      }
-
-      // Duplicate
-      if (isMeta && e.key === 'd') {
-        e.preventDefault();
-        duplicateSelected();
-        return;
-      }
-
-      switch (e.key.toLowerCase()) {
-        case 'g':
-          setTransformModeState('translate');
-          setTransformMode(ctx, 'translate');
-          break;
-        case 'r':
-          setTransformModeState('rotate');
-          setTransformMode(ctx, 'rotate');
-          break;
-        case 's':
-          if (!isMeta) {
-            setTransformModeState('scale');
-            setTransformMode(ctx, 'scale');
-          }
-          break;
-        case 'delete':
-        case 'backspace':
-          if (selectionRef.current.kind === 'light' && selectionRef.current.id) {
-            handleDeleteLight(selectionRef.current.id);
-          } else if (selectedId) {
-            deleteSelectedWithHistory();
-          }
-          break;
-        case 'escape':
-          applySelection(null, null);
-          break;
-      }
-    }
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedId, models, history]);
-
-  const deleteSelectedWithHistory = useCallback(() => {
-    const ctx = viewportRef.current;
-    if (!ctx || !selectedId) return;
-    const model = models.find((m) => m.id === selectedId);
-    if (!model) return;
-
-    const command: Command = {
-      type: 'model:delete',
-      label: `"${model.name}" löschen`,
-      execute: () => {
-        removeModel(ctx, model.id);
-        deleteModel(model.id);
-        setSelectedId(null);
-      },
-      undo: () => {
-        (async () => {
-          const buffer = await getModelBlob(model.id);
-          if (buffer) {
-            await addModel(new File([buffer], model.fileName), model.name);
-          }
-        })();
-      },
-    };
-    history.execute(command);
-    markDirty();
-  }, [selectedId, models, history, deleteModel, getModelBlob, addModel, markDirty]);
+  /**
+   * Copies a model, offset so the duplicate is visible. The transform goes into
+   * the record rather than the live group: the viewport loads models
+   * asynchronously, so the group does not exist yet at this point.
+   */
+  const copyModel = useCallback(
+    async (source: ModelEntry, label: string) => {
+      const buffer = await getModelBlob(source.id);
+      if (!buffer) return;
+      const live = captureModelEntry(source.id) ?? source;
+      const file = new File([buffer], source.fileName);
+      const newModel = await addModel(file, `${source.name} (Kopie)`, {
+        position: [live.position[0] + 0.5, live.position[1], live.position[2] + 0.5],
+        rotation: live.rotation,
+        scale: live.scale,
+      });
+      pushCommand(makeModelAddCommand(newModel, label));
+    },
+    [getModelBlob, captureModelEntry, addModel, makeModelAddCommand, pushCommand],
+  );
 
   const pasteModel = useCallback(async () => {
-    if (!clipboardRef.current) return;
-    const { model, blobId } = clipboardRef.current;
-    const buffer = await getModelBlob(blobId);
-    if (!buffer) return;
-
-    const file = new File([buffer], model.fileName);
-    const newModel = await addModel(file, `${model.name} (Kopie)`);
-
-    const ctx = viewportRef.current;
-    if (ctx) {
-      const group = ctx.models.get(newModel.id);
-      if (group) {
-        group.position.set(model.position[0] + 0.5, model.position[1], model.position[2] + 0.5);
-      }
-    }
-    markDirty();
-  }, [getModelBlob, addModel, markDirty]);
+    const clipboard = clipboardRef.current;
+    if (!clipboard) return;
+    await copyModel(clipboard.model, `"${clipboard.model.name}" einfügen`);
+  }, [copyModel]);
 
   const duplicateSelected = useCallback(async () => {
-    if (!selectedId) return;
+    if (!selectedId || selectionRef.current.kind !== 'model') return;
     const model = models.find((m) => m.id === selectedId);
     if (!model) return;
-
-    const buffer = await getModelBlob(model.id);
-    if (!buffer) return;
-
-    const file = new File([buffer], model.fileName);
-    const newModel = await addModel(file, `${model.name} (Kopie)`);
-
-    const ctx = viewportRef.current;
-    if (ctx) {
-      const srcGroup = ctx.models.get(model.id);
-      const dstGroup = ctx.models.get(newModel.id);
-      if (srcGroup && dstGroup) {
-        dstGroup.position.copy(srcGroup.position).add(new THREE.Vector3(0.5, 0, 0.5));
-        dstGroup.rotation.copy(srcGroup.rotation);
-        dstGroup.scale.copy(srcGroup.scale);
-      }
-    }
-    markDirty();
-  }, [selectedId, models, getModelBlob, addModel, markDirty]);
+    await copyModel(model, `"${model.name}" duplizieren`);
+  }, [selectedId, models, copyModel]);
 
   const handleToggleVisibility = useCallback((modelId: string) => {
     const ctx = viewportRef.current;
@@ -472,82 +778,79 @@ export function EditorPage() {
     setVisibilityMap((prev) => ({ ...prev, [modelId]: newVisible }));
   }, []);
 
-  const applySelection = useCallback((id: string | null, kind: OutlinerSelectionKind | null) => {
-    const ctx = viewportRef.current;
-    selectionRef.current = { id, kind };
-    setSelectedId(id);
-    setSelectedKind(kind);
-    if (!ctx) return;
-    if (kind === 'model') {
-      selectObject(ctx, id, 'model');
-    } else if (kind === 'light') {
-      selectObject(ctx, id, 'light');
-    } else {
-      // environment or cleared selection: no gizmo
-      selectObject(ctx, null, null);
-    }
-  }, []);
-
   const handleOutlinerSelect = useCallback(
-    (id: string | null, kind: OutlinerSelectionKind = 'model') => {
-      applySelection(id, id ? kind : null);
+    (nextId: string | null, kind: OutlinerSelectionKind = 'model') => {
+      applySelection(nextId, nextId ? kind : null);
     },
     [applySelection],
   );
 
   const handleOutlinerRename = useCallback(
     (modelId: string, name: string) => {
-      updateModel(modelId, { name });
-      markDirty();
+      const previous = modelsRef.current.find((m) => m.id === modelId)?.name;
+      if (previous === undefined || previous === name) return;
+      runCommand(
+        stateCommand({
+          type: 'model:rename',
+          label: `"${name}" umbenennen`,
+          before: previous,
+          after: name,
+          apply: (value) => void updateModel(modelId, { name: value }),
+        }),
+      );
     },
-    [updateModel, markDirty],
+    [runCommand, updateModel],
   );
 
   const handleOutlinerDuplicate = useCallback(
     async (modelId: string) => {
       const model = models.find((m) => m.id === modelId);
       if (!model) return;
-      const buffer = await getModelBlob(model.id);
-      if (!buffer) return;
-      const file = new File([buffer], model.fileName);
-      await addModel(file, `${model.name} (Kopie)`);
-      markDirty();
+      await copyModel(model, `"${model.name}" duplizieren`);
     },
-    [models, getModelBlob, addModel, markDirty],
+    [models, copyModel],
   );
 
-  const handleOutlinerDelete = useCallback(
-    (modelId: string) => {
-      const ctx = viewportRef.current;
-      if (!ctx) return;
-      removeModel(ctx, modelId);
-      deleteModel(modelId);
-      if (selectedId === modelId) {
-        setSelectedId(null);
-        setSelectedKind(null);
-        selectionRef.current = { id: null, kind: null };
-      }
-      markDirty();
-    },
-    [deleteModel, selectedId, markDirty],
-  );
+  // ---------------------------------------------------------------------------
+  // Outliner groups
+  // ---------------------------------------------------------------------------
 
   const handleCreateGroup = useCallback(() => {
-    setGroups((prev) => [
-      ...prev,
-      { id: generateId(), name: 'Neue Gruppe', collapsed: false, order: prev.length },
-    ]);
-    markDirty();
-  }, [markDirty]);
+    const group: SceneGroup = {
+      id: generateId(),
+      name: 'Neue Gruppe',
+      collapsed: false,
+      order: groupsRef.current.length,
+    };
+    runCommand(
+      stateCommand({
+        type: 'group:create',
+        label: 'Gruppe anlegen',
+        before: groupsRef.current,
+        after: [...groupsRef.current, group],
+        apply: setGroups,
+      }),
+    );
+  }, [runCommand]);
 
   const handleRenameGroup = useCallback(
     (groupId: string, name: string) => {
-      setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, name } : g)));
-      markDirty();
+      const before = groupsRef.current;
+      if (before.find((g) => g.id === groupId)?.name === name) return;
+      runCommand(
+        stateCommand({
+          type: 'group:rename',
+          label: `Gruppe "${name}" umbenennen`,
+          before,
+          after: before.map((g) => (g.id === groupId ? { ...g, name } : g)),
+          apply: setGroups,
+        }),
+      );
     },
-    [markDirty],
+    [runCommand],
   );
 
+  // Collapsing is a view preference, not an edit — kept out of the undo stack.
   const handleToggleGroupCollapsed = useCallback(
     (groupId: string) => {
       setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, collapsed: !g.collapsed } : g)));
@@ -558,135 +861,416 @@ export function EditorPage() {
 
   const handleDeleteGroup = useCallback(
     (groupId: string) => {
-      const remaining = groups.filter((g) => g.id !== groupId).sort((a, b) => a.order - b.order);
-      const flat: { id: string; order: number; groupId: string | null }[] = [];
+      const before = captureOutliner();
+      const remaining = before.groups.filter((g) => g.id !== groupId).sort((a, b) => a.order - b.order);
+      const placement: OutlinerSnapshot['placement'] = [];
       for (const g of remaining) {
-        for (const m of models.filter((m) => m.groupId === g.id)) {
-          flat.push({ id: m.id, order: flat.length, groupId: g.id });
+        for (const m of modelsRef.current.filter((m) => m.groupId === g.id)) {
+          placement.push({ id: m.id, order: placement.length, groupId: g.id });
         }
       }
-      for (const m of models.filter((m) => !m.groupId || m.groupId === groupId)) {
-        flat.push({ id: m.id, order: flat.length, groupId: null });
+      for (const m of modelsRef.current.filter((m) => !m.groupId || m.groupId === groupId)) {
+        placement.push({ id: m.id, order: placement.length, groupId: null });
       }
-      reorderModels(flat);
-      setGroups(remaining.map((g, i) => ({ ...g, order: i })));
-      markDirty();
+      runCommand(
+        stateCommand({
+          type: 'group:delete',
+          label: 'Gruppe löschen',
+          before,
+          after: { groups: remaining.map((g, i) => ({ ...g, order: i })), placement },
+          apply: applyOutliner,
+        }),
+      );
     },
-    [groups, models, reorderModels, markDirty],
+    [captureOutliner, runCommand, applyOutliner],
   );
 
   const handleReorder = useCallback(
     (items: { id: string; groupId: string | null }[]) => {
-      reorderModels(items.map((it, i) => ({ id: it.id, order: i, groupId: it.groupId })));
-      markDirty();
+      const before = captureOutliner();
+      runCommand(
+        stateCommand({
+          type: 'model:reorder',
+          label: 'Reihenfolge ändern',
+          before,
+          after: {
+            groups: before.groups,
+            placement: items.map((it, i) => ({ id: it.id, order: i, groupId: it.groupId })),
+          },
+          apply: applyOutliner,
+        }),
+      );
     },
-    [reorderModels, markDirty],
+    [captureOutliner, runCommand, applyOutliner],
   );
+
+  // ---------------------------------------------------------------------------
+  // Lights
+  // ---------------------------------------------------------------------------
 
   const handleAddLight = useCallback(
     (type: LightType) => {
-      const entry = createLightEntry(type, lights.length);
-      setLights((prev) => [...prev, entry]);
+      const entry = createLightEntry(type, lightsRef.current.length);
+      commitLights('light:add', `"${entry.name}" hinzufügen`, [...lightsRef.current, entry]);
       applySelection(entry.id, 'light');
-      markDirty();
     },
-    [lights.length, applySelection, markDirty],
+    [commitLights, applySelection],
   );
 
   const handleUpdateLight = useCallback(
     (lightId: string, patch: Partial<LightEntry>) => {
-      setLights((prev) => prev.map((l) => (l.id === lightId ? { ...l, ...patch } : l)));
-      markDirty();
+      commitLights(
+        'light:update',
+        'Lichteigenschaft ändern',
+        lightsRef.current.map((l) => (l.id === lightId ? { ...l, ...patch } : l)),
+        // Collapse a slider drag on one property into a single undo step.
+        `light:${lightId}:${Object.keys(patch).sort().join(',')}`,
+      );
     },
-    [markDirty],
+    [commitLights],
   );
 
   const handleDeleteLight = useCallback(
     (lightId: string) => {
-      setLights((prev) => prev.filter((l) => l.id !== lightId));
-      if (selectedId === lightId) applySelection(null, null);
-      markDirty();
+      const name = lightsRef.current.find((l) => l.id === lightId)?.name ?? 'Licht';
+      commitLights(
+        'light:delete',
+        `"${name}" löschen`,
+        lightsRef.current.filter((l) => l.id !== lightId),
+      );
+      if (selectionRef.current.id === lightId) applySelection(null, null);
     },
-    [selectedId, applySelection, markDirty],
+    [commitLights, applySelection],
   );
 
   const handleToggleLightVisibility = useCallback(
     (lightId: string) => {
-      setLights((prev) =>
-        prev.map((l) => (l.id === lightId ? { ...l, visible: l.visible === false } : l)),
+      commitLights(
+        'light:visibility',
+        'Licht ein-/ausblenden',
+        lightsRef.current.map((l) => (l.id === lightId ? { ...l, visible: l.visible === false } : l)),
       );
-      markDirty();
     },
-    [markDirty],
+    [commitLights],
   );
 
   const handleRenameLight = useCallback(
     (lightId: string, name: string) => {
-      setLights((prev) => prev.map((l) => (l.id === lightId ? { ...l, name } : l)));
-      markDirty();
+      if (lightsRef.current.find((l) => l.id === lightId)?.name === name) return;
+      commitLights(
+        'light:rename',
+        `"${name}" umbenennen`,
+        lightsRef.current.map((l) => (l.id === lightId ? { ...l, name } : l)),
+      );
     },
-    [markDirty],
+    [commitLights],
   );
 
+  // ---------------------------------------------------------------------------
+  // Environment / world
+  // ---------------------------------------------------------------------------
+
   const handleEnvironmentUpload = useCallback(
-    async (file: File) => {
+    async (result: EnvironmentUploadResult) => {
       if (!id) return;
       const db = await getDB();
       const blobId = generateId();
-      const buffer = await file.arrayBuffer();
+      const buffer = await result.file.arrayBuffer();
       await db.put('blobs', { id: blobId, data: buffer });
-      // Drop a previously stored environment blob to avoid orphans.
-      if (environment?.blobId) await db.delete('blobs', environment.blobId).catch(() => {});
-      setEnvironment({
-        blobId,
-        fileName: file.name,
-        showBackground: false,
-        useForReflection: true,
-        intensity: 1,
-        blurriness: 0,
-      });
+      // The previous blob stays put so undo can restore the old environment;
+      // `sweepOrphanBlobs` collects it once it is unreachable.
+      const before = environmentRef.current;
+      runCommand(
+        stateCommand({
+          type: 'environment:set',
+          label: result.presetId
+            ? 'Standard-HDRI setzen'
+            : before
+              ? 'Umgebung ersetzen'
+              : 'Umgebung setzen',
+          before,
+          after: {
+            blobId,
+            fileName: result.file.name,
+            // Replacing the image must not throw away the dome, intensity and
+            // blur the user set up — "Bild ersetzen" from the properties panel
+            // runs through here too.
+            showBackground: before?.showBackground ?? false,
+            useForReflection: before?.useForReflection ?? true,
+            intensity: before?.intensity ?? 1,
+            blurriness: before?.blurriness ?? 0,
+            format: result.format,
+            fileSize: result.file.size,
+            width: result.width || undefined,
+            height: result.height || undefined,
+            sourceFileName: result.sourceFileName,
+            presetId: result.presetId,
+          },
+          apply: setEnvironment,
+        }),
+      );
       applySelection('__environment__', 'environment');
-      markDirty();
     },
-    [id, environment, applySelection, markDirty],
+    [id, runCommand, applySelection],
   );
 
   const handleUpdateEnvironment = useCallback(
     (patch: Partial<EnvironmentConfig>) => {
-      setEnvironment((prev) => (prev ? { ...prev, ...patch } : prev));
-      markDirty();
+      const before = environmentRef.current;
+      if (!before) return;
+      runCommand(
+        stateCommand({
+          type: 'environment:update',
+          label: 'Umgebung ändern',
+          before,
+          after: { ...before, ...patch },
+          apply: setEnvironment,
+          mergeKey: `environment:${Object.keys(patch).sort().join(',')}`,
+        }),
+      );
     },
-    [markDirty],
+    [runCommand],
   );
 
-  const handleRemoveEnvironment = useCallback(async () => {
-    const current = environment;
-    setEnvironment(null);
-    if (selectedKind === 'environment') applySelection(null, null);
-    if (current?.blobId) {
-      const db = await getDB();
-      await db.delete('blobs', current.blobId).catch(() => {});
-    }
-    markDirty();
-  }, [environment, selectedKind, applySelection, markDirty]);
+  const handleRemoveEnvironment = useCallback(() => {
+    const before = environmentRef.current;
+    if (!before) return;
+    runCommand(
+      stateCommand({
+        type: 'environment:remove',
+        label: 'Umgebung entfernen',
+        before,
+        after: null,
+        apply: setEnvironment,
+      }),
+    );
+    if (selectionRef.current.kind === 'environment') applySelection(null, null);
+  }, [runCommand, applySelection]);
 
   const handleUpdateBackground = useCallback(
     (color: string) => {
-      setBackground(color);
-      markDirty();
+      if (backgroundRef.current === color) return;
+      runCommand(
+        stateCommand({
+          type: 'world:background',
+          label: 'Hintergrundfarbe ändern',
+          before: backgroundRef.current,
+          after: color,
+          apply: setBackground,
+          mergeKey: 'world:background',
+        }),
+      );
     },
-    [markDirty],
+    [runCommand],
   );
 
-  const handleTransformModeChange = useCallback((mode: TransformMode) => {
-    setTransformModeState(mode);
+  // ---------------------------------------------------------------------------
+  // Camera path
+  // ---------------------------------------------------------------------------
+
+  const selectedKeyframe = useMemo<KeyframeSelection | null>(() => {
+    if (selectedKind !== 'keyframe') return null;
+    const parsed = parseKeyframeRef(selectedId);
+    if (!parsed) return null;
+    const index = keyframes.findIndex((kf) => kf.id === parsed.id);
+    if (index < 0) return null;
+    return { keyframe: keyframes[index], index: index + 1, part: parsed.part };
+  }, [selectedKind, selectedId, keyframes]);
+
+  const selectKeyframe = useCallback(
+    (keyframeId: string | null, part: KeyframePart = 'position') => {
+      if (!keyframeId) {
+        applySelection(null, null);
+        return;
+      }
+      applySelection(formatKeyframeRef(keyframeId, part), 'keyframe');
+    },
+    [applySelection],
+  );
+
+  /** Camera position and orbit target as a keyframe. */
+  const readCameraPose = useCallback((): Pick<Keyframe, 'position' | 'lookAt'> | null => {
     const ctx = viewportRef.current;
-    if (ctx) setTransformMode(ctx, mode);
+    if (!ctx) return null;
+    const pos = ctx.camera.position;
+    const target = ctx.orbitControls.target;
+    return {
+      position: [pos.x, pos.y, pos.z],
+      lookAt: [target.x, target.y, target.z],
+    };
+  }, []);
+
+  const handleAddKeyframe = useCallback(() => {
+    const pose = readCameraPose();
+    if (!pose) return;
+    const keyframe: Keyframe = { id: generateId(), ...pose };
+    const current = keyframesRef.current;
+    // Insert behind the selected keyframe, matching how DCC timelines behave.
+    const selectedIndex = selectedKeyframe
+      ? current.findIndex((kf) => kf.id === selectedKeyframe.keyframe.id)
+      : -1;
+    const at = selectedIndex >= 0 ? selectedIndex + 1 : current.length;
+    const next = [...current.slice(0, at), keyframe, ...current.slice(at)];
+    commitKeyframes('keyframe:add', `Keyframe ${at + 1} hinzufügen`, next);
+    selectKeyframe(keyframe.id);
+  }, [readCameraPose, selectedKeyframe, commitKeyframes, selectKeyframe]);
+
+  const handleDuplicateKeyframe = useCallback(
+    (keyframeId: string) => {
+      const current = keyframesRef.current;
+      const at = current.findIndex((kf) => kf.id === keyframeId);
+      if (at < 0) return;
+      const copy: Keyframe = { ...current[at], id: generateId() };
+      const next = [...current.slice(0, at + 1), copy, ...current.slice(at + 1)];
+      commitKeyframes('keyframe:duplicate', `Keyframe ${at + 1} duplizieren`, next);
+      selectKeyframe(copy.id);
+    },
+    [commitKeyframes, selectKeyframe],
+  );
+
+  const handleUpdateKeyframe = useCallback(
+    (keyframeId: string, patch: Partial<Omit<Keyframe, 'id'>>) => {
+      const current = keyframesRef.current;
+      const at = current.findIndex((kf) => kf.id === keyframeId);
+      if (at < 0) return;
+      commitKeyframes(
+        'keyframe:update',
+        `Keyframe ${at + 1} ändern`,
+        current.map((kf) => (kf.id === keyframeId ? { ...kf, ...patch } : kf)),
+        `keyframe:${keyframeId}:${Object.keys(patch).sort().join(',')}`,
+      );
+    },
+    [commitKeyframes],
+  );
+
+  const handleCaptureKeyframeFromCamera = useCallback(
+    (keyframeId: string) => {
+      const pose = readCameraPose();
+      if (!pose) return;
+      const at = keyframesRef.current.findIndex((kf) => kf.id === keyframeId);
+      if (at < 0) return;
+      commitKeyframes(
+        'keyframe:capture',
+        `Keyframe ${at + 1} auf Ansicht setzen`,
+        keyframesRef.current.map((kf) => (kf.id === keyframeId ? { ...kf, ...pose } : kf)),
+      );
+    },
+    [readCameraPose, commitKeyframes],
+  );
+
+  const handleJumpToKeyframe = useCallback((keyframeId: string) => {
+    const ctx = viewportRef.current;
+    const keyframe = keyframesRef.current.find((kf) => kf.id === keyframeId);
+    if (!ctx || !keyframe) return;
+    ctx.camera.position.set(...keyframe.position);
+    ctx.orbitControls.target.set(...keyframe.lookAt);
+    ctx.orbitControls.update();
+  }, []);
+
+  const handleDeleteKeyframe = useCallback(
+    (keyframeId: string) => {
+      const at = keyframesRef.current.findIndex((kf) => kf.id === keyframeId);
+      if (at < 0) return;
+      commitKeyframes(
+        'keyframe:delete',
+        `Keyframe ${at + 1} löschen`,
+        keyframesRef.current.filter((kf) => kf.id !== keyframeId),
+      );
+      if (parseKeyframeRef(selectionRef.current.id)?.id === keyframeId) applySelection(null, null);
+    },
+    [commitKeyframes, applySelection],
+  );
+
+  const handleReorderKeyframes = useCallback(
+    (orderedIds: string[]) => {
+      const byId = new Map(keyframesRef.current.map((kf) => [kf.id, kf]));
+      const next = orderedIds.map((keyframeId) => byId.get(keyframeId)).filter((kf): kf is Keyframe => !!kf);
+      if (next.length !== keyframesRef.current.length) return;
+      commitKeyframes('keyframe:reorder', 'Keyframe-Reihenfolge ändern', next);
+    },
+    [commitKeyframes],
+  );
+
+  const handleLoopChange = useCallback(
+    (nextLoop: boolean) => {
+      runCommand(
+        stateCommand({
+          type: 'camerapath:loop',
+          label: nextLoop ? 'Loop aktivieren' : 'Loop deaktivieren',
+          before: isLoop,
+          after: nextLoop,
+          apply: setIsLoop,
+        }),
+      );
+    },
+    [runCommand, isLoop],
+  );
+
+  const handleSpeedChange = useCallback(
+    (nextSpeed: number) => {
+      if (nextSpeed === cameraSpeed) return;
+      runCommand(
+        stateCommand({
+          type: 'camerapath:speed',
+          label: 'Geschwindigkeit ändern',
+          before: cameraSpeed,
+          after: nextSpeed,
+          apply: setCameraSpeed,
+          mergeKey: 'camerapath:speed',
+        }),
+      );
+    },
+    [runCommand, cameraSpeed],
+  );
+
+  const handleImportPath = useCallback(
+    (data: CameraPathImport) => {
+      const before = captureCameraPath();
+      runCommand(
+        stateCommand({
+          type: 'camerapath:import',
+          label: 'Kamerafahrt importieren',
+          before,
+          after: {
+            keyframes: Array.isArray(data.keyframes)
+              ? data.keyframes.map((kf) => ({ id: generateId(), position: kf.position, lookAt: kf.lookAt }))
+              : before.keyframes,
+            isLoop: typeof data.isLoop === 'boolean' ? data.isLoop : before.isLoop,
+            speed: typeof data.speed === 'number' ? data.speed : before.speed,
+          },
+          apply: applyCameraPath,
+        }),
+      );
+      applySelection(null, null);
+    },
+    [captureCameraPath, runCommand, applyCameraPath, applySelection],
+  );
+
+  const handleToggleKeyframeEditor = useCallback(() => {
+    // Path markers are only pickable while the editor is open, so drop a
+    // keyframe selection on the way out rather than leaving an orphaned gizmo.
+    if (showKeyframeEditor && selectionRef.current.kind === 'keyframe') applySelection(null, null);
+    setShowKeyframeEditor(!showKeyframeEditor);
+  }, [showKeyframeEditor, applySelection]);
+
+  // ---------------------------------------------------------------------------
+  // Viewport interaction
+  // ---------------------------------------------------------------------------
+
+  const handleTransformModeChange = useCallback((mode: TransformMode) => {
+    const ctx = viewportRef.current;
+    // Lights and keyframe markers reject rotate/scale — don't light up a
+    // toolbar button that had no effect.
+    if (ctx && !setTransformMode(ctx, mode)) return;
+    setTransformModeState(mode);
   }, []);
 
   const handleModelClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const ctx = viewportRef.current;
     if (!ctx || !canvasRef.current) return;
+    // Ignore the mouse-up that ends a gizmo drag; it would clear the selection.
+    if (ctx.transformControls.dragging) return;
+    if (performance.now() - lastDragEndRef.current < CLICK_AFTER_DRAG_MS) return;
 
     const rect = canvasRef.current.getBoundingClientRect();
     const mouse = new THREE.Vector2(
@@ -696,6 +1280,16 @@ export function EditorPage() {
 
     const raycaster = new THREE.Raycaster();
     raycaster.setFromCamera(mouse, ctx.camera);
+
+    // Path markers take precedence: they are small and sit in front of models.
+    const markers = pickableKeyframeMarkers(ctx.keyframeMarkers);
+    if (markers.length) {
+      const markerHits = raycaster.intersectObjects(markers, false);
+      if (markerHits.length > 0) {
+        applySelection(markerHits[0].object.name, 'keyframe');
+        return;
+      }
+    }
 
     const objects = Array.from(ctx.models.values());
     const intersects = raycaster.intersectObjects(objects, true);
@@ -713,32 +1307,95 @@ export function EditorPage() {
     applySelection(null, null);
   }, [applySelection]);
 
-  const handleUpload = useCallback(
-    async (file: File) => {
-      const newModel = await addModel(file);
-      const command: Command = {
-        type: 'model:add',
-        label: `"${newModel.name}" hinzufügen`,
-        execute: () => {},
-        undo: () => {
-          const ctx = viewportRef.current;
-          if (ctx) removeModel(ctx, newModel.id);
-          deleteModel(newModel.id);
-        },
-      };
-      history.execute(command);
-      markDirty();
-    },
-    [addModel, deleteModel, history, markDirty],
-  );
+  // Keyboard shortcuts
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      const ctx = viewportRef.current;
+      if (!ctx) return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 
-  const handleKeyframesChange = useCallback(
-    (newKeyframes: Keyframe[]) => {
-      setKeyframes(newKeyframes);
-      markDirty();
-    },
-    [markDirty],
-  );
+      const isMeta = e.metaKey || e.ctrlKey;
+
+      // Undo/Redo
+      if (isMeta && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        handleUndo();
+        return;
+      }
+      if (isMeta && e.key === 'z' && e.shiftKey) {
+        e.preventDefault();
+        handleRedo();
+        return;
+      }
+
+      // Copy
+      if (isMeta && e.key === 'c') {
+        if (selectedId && selectionRef.current.kind === 'model') {
+          const model = models.find((m) => m.id === selectedId);
+          if (model) {
+            clipboardRef.current = { model, blobId: model.id };
+          }
+        }
+        return;
+      }
+
+      // Paste
+      if (isMeta && e.key === 'v') {
+        e.preventDefault();
+        void pasteModel();
+        return;
+      }
+
+      // Duplicate
+      if (isMeta && e.key === 'd') {
+        e.preventDefault();
+        void duplicateSelected();
+        return;
+      }
+
+      switch (e.key.toLowerCase()) {
+        case 'g':
+          handleTransformModeChange('translate');
+          break;
+        case 'r':
+          handleTransformModeChange('rotate');
+          break;
+        case 's':
+          if (!isMeta) handleTransformModeChange('scale');
+          break;
+        case 'delete':
+        case 'backspace': {
+          const sel = selectionRef.current;
+          if (sel.kind === 'light' && sel.id) {
+            handleDeleteLight(sel.id);
+          } else if (sel.kind === 'keyframe' && sel.id) {
+            const parsed = parseKeyframeRef(sel.id);
+            if (parsed) handleDeleteKeyframe(parsed.id);
+          } else if (sel.kind === 'model' && sel.id) {
+            deleteModelWithHistory(sel.id);
+          }
+          break;
+        }
+        case 'escape':
+          applySelection(null, null);
+          break;
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [
+    selectedId,
+    models,
+    handleUndo,
+    handleRedo,
+    pasteModel,
+    duplicateSelected,
+    handleTransformModeChange,
+    handleDeleteLight,
+    handleDeleteKeyframe,
+    deleteModelWithHistory,
+    applySelection,
+  ]);
 
   if (!project) {
     return (
@@ -756,14 +1413,14 @@ export function EditorPage() {
         onAddModel={() => setShowUploadDialog(true)}
         onAddLight={handleAddLight}
         onAddEnvironment={() => setShowEnvDialog(true)}
-        onOpenKeyframeEditor={() => setShowKeyframeEditor(!showKeyframeEditor)}
+        onOpenKeyframeEditor={handleToggleKeyframeEditor}
         onExport={async () => {
           await performSave();
           setShowExportDialog(true);
         }}
         onBack={handleBack}
-        onUndo={history.undo}
-        onRedo={history.redo}
+        onUndo={handleUndo}
+        onRedo={handleRedo}
         history={history}
         projectName={project.name}
         saveStatus={saveStatus}
@@ -782,7 +1439,7 @@ export function EditorPage() {
         onToggleVisibility={handleToggleVisibility}
         onRename={handleOutlinerRename}
         onDuplicate={handleOutlinerDuplicate}
-        onDelete={handleOutlinerDelete}
+        onDelete={deleteModelWithHistory}
         onToggleLightVisibility={handleToggleLightVisibility}
         onRenameLight={handleRenameLight}
         onDeleteLight={handleDeleteLight}
@@ -802,30 +1459,53 @@ export function EditorPage() {
       />
       {(selectedKind === 'world' ||
         (selectedKind === 'light' && selectedId) ||
-        (selectedKind === 'environment' && environment)) && (
+        (selectedKind === 'environment' && environment) ||
+        selectedKeyframe) && (
         <PropertiesPanel
           light={selectedKind === 'light' ? lights.find((l) => l.id === selectedId) ?? null : null}
           environment={selectedKind === 'environment' ? environment : null}
           background={selectedKind === 'world' ? background : null}
+          keyframe={selectedKeyframe}
           onUpdateLight={handleUpdateLight}
           onUpdateEnvironment={handleUpdateEnvironment}
           onReplaceEnvironment={() => setShowEnvDialog(true)}
           onUpdateBackground={handleUpdateBackground}
+          onUpdateKeyframe={handleUpdateKeyframe}
+          onSelectKeyframePart={selectKeyframe}
+          onCaptureKeyframeFromCamera={handleCaptureKeyframeFromCamera}
+          onJumpToKeyframe={handleJumpToKeyframe}
+          onDuplicateKeyframe={handleDuplicateKeyframe}
+          onDeleteKeyframe={handleDeleteKeyframe}
         />
       )}
       {showKeyframeEditor && (
         <KeyframeEditor
-          viewportCtx={viewportRef.current}
+          viewportCtx={viewport}
           keyframes={keyframes}
           isLoop={isLoop}
           speed={cameraSpeed}
-          onKeyframesChange={handleKeyframesChange}
-          onLoopChange={(v) => { setIsLoop(v); markDirty(); }}
-          onSpeedChange={(v) => { setCameraSpeed(v); markDirty(); }}
+          selectedKeyframeId={selectedKeyframe?.keyframe.id ?? null}
+          showSpline={showSpline}
+          showMarkers={showMarkers}
+          onToggleSpline={setShowSpline}
+          onToggleMarkers={setShowMarkers}
+          onSelectKeyframe={(keyframeId) => selectKeyframe(keyframeId)}
+          onAddKeyframe={handleAddKeyframe}
+          onJumpToKeyframe={handleJumpToKeyframe}
+          onDeleteKeyframe={handleDeleteKeyframe}
+          onReorderKeyframes={handleReorderKeyframes}
+          onLoopChange={handleLoopChange}
+          onSpeedChange={handleSpeedChange}
+          onImportPath={handleImportPath}
         />
       )}
       <ModelUploadDialog open={showUploadDialog} onOpenChange={setShowUploadDialog} onUpload={handleUpload} />
-      <EnvironmentUploadDialog open={showEnvDialog} onOpenChange={setShowEnvDialog} onUpload={handleEnvironmentUpload} />
+      <EnvironmentUploadDialog
+        open={showEnvDialog}
+        onOpenChange={setShowEnvDialog}
+        onUpload={handleEnvironmentUpload}
+        current={environment}
+      />
       <ExportDialog
         open={showExportDialog}
         onOpenChange={setShowExportDialog}

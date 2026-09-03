@@ -5,7 +5,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { ArrowLeft, Play, Pause } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { getDB, type Project } from '@/lib/db';
+import { getDB, environmentFormat, type Project } from '@/lib/db';
 import { buildSplines, getCameraAtProgress, type Keyframe } from '@/three/camera-path';
 import {
   syncLights,
@@ -83,7 +83,7 @@ export function PreviewPage() {
         const db = await getDB();
         const blob = await db.get('blobs', env.blobId);
         if (!blob || envCancelled) return;
-        const texture = await loadEquirectTexture(new Blob([blob.data]), env.fileName);
+        const texture = await loadEquirectTexture(new Blob([blob.data]), env.fileName, environmentFormat(env));
         if (envCancelled) {
           texture.dispose();
           return;

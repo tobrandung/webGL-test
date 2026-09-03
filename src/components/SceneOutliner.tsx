@@ -40,7 +40,11 @@ import type { ModelEntry, SceneGroup, LightEntry, EnvironmentConfig } from '@/li
 
 type ReorderItem = { id: string; groupId: string | null };
 
-export type OutlinerSelectionKind = 'model' | 'light' | 'environment' | 'world';
+/**
+ * Kinds that can be selected in the editor. `keyframe` never originates from
+ * the outliner — it travels the same channel so only one gizmo is ever active.
+ */
+export type OutlinerSelectionKind = 'model' | 'light' | 'environment' | 'world' | 'keyframe';
 
 const ENVIRONMENT_SELECTION_ID = '__environment__';
 export const WORLD_SELECTION_ID = '__world__';

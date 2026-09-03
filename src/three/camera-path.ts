@@ -1,9 +1,41 @@
 import * as THREE from 'three';
 
 export type Keyframe = {
+  /**
+   * Stable identity so a keyframe survives edits, reordering and deletion of
+   * its neighbours. Projects saved before keyframe editing existed lack it and
+   * get one assigned on load.
+   */
+  id: string;
   position: [number, number, number];
   lookAt: [number, number, number];
 };
+
+/** Which of a keyframe's two draggable points a selection refers to. */
+export type KeyframePart = 'position' | 'lookAt';
+
+const REF_SEPARATOR = '#';
+
+/**
+ * Composite selection id for a single draggable keyframe marker. Keyframe
+ * selection travels through the same single-id channel as models and lights
+ * (so only ever one transform gizmo is attached), hence the packed form.
+ */
+export function formatKeyframeRef(id: string, part: KeyframePart): string {
+  return `${id}${REF_SEPARATOR}${part}`;
+}
+
+export function parseKeyframeRef(ref: string | null | undefined): { id: string; part: KeyframePart } | null {
+  if (!ref) return null;
+  const at = ref.lastIndexOf(REF_SEPARATOR);
+  if (at <= 0) return null;
+  const part = ref.slice(at + 1);
+  if (part !== 'position' && part !== 'lookAt') return null;
+  return { id: ref.slice(0, at), part };
+}
+
+/** The two points a path segment interpolates — all `buildSplines` needs. */
+export type KeyframePose = Pick<Keyframe, 'position' | 'lookAt'>;
 
 export type CameraPathState = {
   keyframes: Keyframe[];
@@ -12,7 +44,7 @@ export type CameraPathState = {
   isLoop: boolean;
 };
 
-export function buildSplines(keyframes: Keyframe[], isLoop: boolean): {
+export function buildSplines(keyframes: readonly KeyframePose[], isLoop: boolean): {
   positionSpline: THREE.CatmullRomCurve3 | null;
   lookAtSpline: THREE.CatmullRomCurve3 | null;
 } {

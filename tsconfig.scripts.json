@@ -1,0 +1,17 @@
+{
+  // The Node-side type check for scripts/ and the pure core they share with the
+  // app. Kept separate from tsconfig.json on purpose: pulling @types/node into
+  // the app's program would make Node globals (Buffer, process, Node's
+  // setTimeout signature) visible in browser code that must not use them.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "module": "NodeNext",
+    "moduleResolution": "nodenext"
+  },
+  // Only the scripts themselves: TypeScript pulls in the src/lib/hdri modules
+  // they actually import, so this program is exactly the Node-reachable subset.
+  // Listing src/lib/hdri wholesale would drag in the browser-only encoders,
+  // whose dependencies do not resolve under nodenext.
+  "include": ["scripts"]
+}

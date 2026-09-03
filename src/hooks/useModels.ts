@@ -18,7 +18,16 @@ export function useModels(projectId: string) {
   }, [load]);
 
   const addModel = useCallback(
-    async (file: File, name?: string): Promise<ModelEntry> => {
+    async (
+      file: File,
+      name?: string,
+      /**
+       * Initial transform. Written into the record rather than applied to the
+       * viewport group afterwards, because models are loaded asynchronously —
+       * the group does not exist yet when the caller returns.
+       */
+      transform?: Pick<ModelEntry, 'position' | 'rotation' | 'scale'>,
+    ): Promise<ModelEntry> => {
       const db = await getDB();
       const id = generateId();
       const buffer = await file.arrayBuffer();
@@ -30,9 +39,9 @@ export function useModels(projectId: string) {
         name: name ?? file.name.replace(/\.[^.]+$/, ''),
         fileName: file.name,
         fileSize: file.size,
-        position: [0, 0, 0],
-        rotation: [0, 0, 0],
-        scale: [1, 1, 1],
+        position: transform?.position ?? [0, 0, 0],
+        rotation: transform?.rotation ?? [0, 0, 0],
+        scale: transform?.scale ?? [1, 1, 1],
         createdAt: now,
         order: now,
         groupId: null,
@@ -60,13 +69,25 @@ export function useModels(projectId: string) {
     [load],
   );
 
+  /**
+   * Removes the model record but deliberately keeps its blob, so an undo can
+   * restore the model without having to hold the (potentially huge) buffer in
+   * the history stack. Unreferenced blobs are collected by `sweepOrphanBlobs`.
+   */
   const deleteModel = useCallback(
     async (id: string) => {
       const db = await getDB();
-      const tx = db.transaction(['models', 'blobs'], 'readwrite');
-      await tx.objectStore('models').delete(id);
-      await tx.objectStore('blobs').delete(id);
-      await tx.done;
+      await db.delete('models', id);
+      await load();
+    },
+    [load],
+  );
+
+  /** Writes a previously captured entry back under its original id (undo). */
+  const restoreModel = useCallback(
+    async (entry: ModelEntry) => {
+      const db = await getDB();
+      await db.put('models', entry);
       await load();
     },
     [load],
@@ -98,5 +119,5 @@ export function useModels(projectId: string) {
     [load],
   );
 
-  return { models, loading, addModel, updateModel, deleteModel, getModelBlob, reorderModels };
+  return { models, loading, addModel, updateModel, deleteModel, restoreModel, getModelBlob, reorderModels };
 }

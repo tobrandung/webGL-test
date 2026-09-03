@@ -15,9 +15,18 @@ import {
   type EnvironmentState,
   type EnvironmentOptions,
 } from './lighting';
+import {
+  createKeyframeMarkerState,
+  syncKeyframeMarkers,
+  disposeKeyframeMarkers,
+  findKeyframeMarker,
+  type KeyframeMarkerState,
+  type KeyframeMarkerOptions,
+} from './keyframe-markers';
+import type { Keyframe } from './camera-path';
 import type { LightEntry } from '@/lib/db';
 
-export type SelectionKind = 'model' | 'light';
+export type SelectionKind = 'model' | 'light' | 'keyframe';
 
 export type ViewportContext = {
   scene: THREE.Scene;
@@ -27,6 +36,7 @@ export type ViewportContext = {
   transformControls: TransformControls;
   models: Map<string, THREE.Group>;
   lights: Map<string, LightRecord>;
+  keyframeMarkers: KeyframeMarkerState;
   environmentState: EnvironmentState;
   selectedModelId: string | null;
   selectedId: string | null;
@@ -81,6 +91,7 @@ export function createViewport(
 
   const models = new Map<string, THREE.Group>();
   const lights = new Map<string, LightRecord>();
+  const keyframeMarkers = createKeyframeMarkerState();
   let animationId = 0;
   let disposed = false;
 
@@ -111,12 +122,14 @@ export function createViewport(
     transformControls,
     models,
     lights,
+    keyframeMarkers,
     environmentState: EMPTY_ENVIRONMENT,
     selectedModelId: null,
     selectedId: null,
     selectedKind: null,
     dispose() {
       disposed = true;
+      disposeKeyframeMarkers(scene, keyframeMarkers);
       cancelAnimationFrame(animationId);
       resizeObserver.disconnect();
       transformControls.dispose();
@@ -129,6 +142,15 @@ export function createViewport(
 /** Reconciles the editor scene lights with the given entries (with helpers). */
 export function applyViewportLights(ctx: ViewportContext, entries: LightEntry[]) {
   syncLights(ctx.scene, entries, ctx.lights, { helpers: true });
+}
+
+/** Reconciles the camera-path markers and spline with the given keyframes. */
+export function applyKeyframeMarkers(
+  ctx: ViewportContext,
+  keyframes: Keyframe[],
+  options: KeyframeMarkerOptions,
+) {
+  syncKeyframeMarkers(ctx.scene, ctx.keyframeMarkers, keyframes, options);
 }
 
 /** Applies (or clears) the equirect environment for the editor viewport. */
@@ -146,8 +168,13 @@ export function setViewportEnvironment(
  * `render()` because the WebGL drawing buffer is not preserved between frames.
  */
 export function captureThumbnail(ctx: ViewportContext, width = 320, height = 180): string {
-  ctx.renderer.render(ctx.scene, ctx.camera);
   const source = ctx.renderer.domElement;
+  // A collapsed container (a hidden panel, a zero-height layout) leaves the
+  // canvas at 0x0, and `drawImage` throws InvalidStateError on a zero-size
+  // source. That used to take the whole debounced autosave down with it and
+  // silently lose every edit, so bail out and keep the previous thumbnail.
+  if (!source.width || !source.height) return '';
+  ctx.renderer.render(ctx.scene, ctx.camera);
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
@@ -249,6 +276,18 @@ export function selectObject(ctx: ViewportContext, id: string | null, kind: Sele
     return;
   }
 
+  if (kind === 'keyframe') {
+    const marker = findKeyframeMarker(ctx.keyframeMarkers, id);
+    if (marker) {
+      // A path point is a plain point in space: translation only.
+      ctx.transformControls.setMode('translate');
+      ctx.transformControls.attach(marker);
+    } else {
+      ctx.transformControls.detach();
+    }
+    return;
+  }
+
   const record = ctx.lights.get(id);
   if (record && !(record.light instanceof THREE.AmbientLight)) {
     // Lights only support translation; direction derives from position -> target.
@@ -263,10 +302,12 @@ export function selectModel(ctx: ViewportContext, id: string | null) {
   selectObject(ctx, id, id ? 'model' : null);
 }
 
-export function setTransformMode(ctx: ViewportContext, mode: TransformMode) {
-  // Lights are translate-only; ignore rotate/scale while a light is selected.
-  if (ctx.selectedKind === 'light' && mode !== 'translate') return;
+/** Returns false when the mode is rejected for the current selection. */
+export function setTransformMode(ctx: ViewportContext, mode: TransformMode): boolean {
+  // Lights and keyframe markers are translate-only; ignore rotate/scale there.
+  if (ctx.selectedKind !== null && ctx.selectedKind !== 'model' && mode !== 'translate') return false;
   ctx.transformControls.setMode(mode);
+  return true;
 }
 
 export function removeModel(ctx: ViewportContext, id: string) {

@@ -34,8 +34,11 @@ import { Switch } from '@/components/ui/switch';
 import { Separator } from '@/components/ui/separator';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { getDB, type Project, type ModelEntry } from '@/lib/db';
-import { cn, slugify } from '@/lib/utils';
+import { getDB, environmentFormat, type Project, type ModelEntry } from '@/lib/db';
+import { ENVIRONMENT_FORMAT_LABEL, extensionForFormat } from '@/lib/hdri/format';
+import { cn, slugify, formatBytes } from '@/lib/utils';
+import { InfoHint } from '@/components/ui/info-hint';
+import { Notice } from '@/components/ui/notice';
 
 type ExportMode = 'scroll' | 'autoplay' | 'loop';
 type ExportTab = 'display' | 'hosting' | 'embed';
@@ -85,36 +88,6 @@ function formatStamp(ts: number): string {
   const d = new Date(ts);
   const p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-}
-
-/** Kleiner Info-/Warn-Button, der Detailtexte in einen Tooltip auslagert. */
-function InfoHint({
-  children,
-  variant = 'info',
-  label = 'Mehr Infos',
-}: {
-  children: ReactNode;
-  variant?: 'info' | 'warning';
-  label?: string;
-}) {
-  const Icon = variant === 'warning' ? AlertTriangle : Info;
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          aria-label={label}
-          className={cn(
-            'inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-            variant === 'warning' && 'text-orange-400 hover:text-orange-300',
-          )}
-        >
-          <Icon className="h-3.5 w-3.5" />
-        </button>
-      </TooltipTrigger>
-      <TooltipContent className="max-w-xs text-left leading-relaxed">{children}</TooltipContent>
-    </Tooltip>
-  );
 }
 
 type ExportDialogProps = {
@@ -218,6 +191,7 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
   const [savingFolder, setSavingFolder] = useState(false);
   const [folderStatus, setFolderStatus] = useState<string | null>(null);
   const [includeEnv, setIncludeEnv] = useState(true);
+  const [envBytes, setEnvBytes] = useState(0);
   const [envFolderStatus, setEnvFolderStatus] = useState<string | null>(null);
   const [token, setToken] = useState(() =>
     typeof window !== 'undefined' ? (localStorage.getItem(TOKEN_STORAGE_KEY) ?? '') : '',
@@ -245,6 +219,16 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
       const db = await getDB();
       const all = await db.getAllFromIndex('models', 'by-project', project.id);
       setModels(all);
+      // Deriving from the blob rather than only from `fileSize` keeps the number
+      // right for environments stored before that field existed — which is why
+      // no record migration is needed.
+      const env = project.environment;
+      if (!env) {
+        setEnvBytes(0);
+        return;
+      }
+      const record = await db.get('blobs', env.blobId);
+      setEnvBytes(env.fileSize ?? record?.data.byteLength ?? 0);
     })();
   }, [open, project]);
 
@@ -326,7 +310,7 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
     };
     // panelHeight absichtlich nicht in deps – sonst Endlosschleife.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- height sync on tab/content change only
-  }, [open, activeTab, exportMode, resolutionId, transparent, includeEnv, models, project?.environment, uploading, uploadLog, uploadError, folderStatus, envFolderStatus, deployedSha, owner, repo, branch, copied]);
+  }, [open, activeTab, exportMode, resolutionId, transparent, includeEnv, models, project?.environment, uploading, uploadLog, uploadError, folderStatus, envFolderStatus, deployedSha, owner, repo, branch, copied, envBytes]);
 
   // Sliding Pill unter dem aktiven Tab.
   useLayoutEffect(() => {
@@ -373,8 +357,13 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
   const modelPath = (m: ModelEntry) =>
     assetUrl(`dist-widget/models/${projectSlug}/${modelFileName(m)}`, m.fileSize);
   const environment = project?.environment ?? null;
-  const envFileName = environment ? `${environment.blobId}.${fileExtension(environment.fileName)}` : '';
-  const envPath = `${baseUrl}/dist-widget/env/${projectSlug}/${envFileName}`;
+  const envFormat = environment ? environmentFormat(environment) : null;
+  // Derive the extension from the format, not from the stored name: an Ultra HDR
+  // file must keep its `.uhdr.jpg` marker so a widget that only sees the URL
+  // still picks the right decoder.
+  const envFileName = environment && envFormat ? `${environment.blobId}${extensionForFormat(envFormat)}` : '';
+  const envPath = assetUrl(`dist-widget/env/${projectSlug}/${envFileName}`, envBytes);
+  const envOversized = Boolean(environment) && envBytes > JSDELIVR_MAX_BYTES;
   const oversizedModels = models.filter((m) => m.fileSize > JSDELIVR_MAX_BYTES);
 
   const getEmbedCode = useCallback(() => {
@@ -391,7 +380,8 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
       mode: exportMode,
       transparent,
       background: transparent ? 'transparent' : project.settings.background,
-      keyframes: project.cameraPath.keyframes,
+      // Editor-only keyframe ids are of no use to the widget.
+      keyframes: project.cameraPath.keyframes.map(({ position, lookAt }) => ({ position, lookAt })),
       isLoop: exportMode === 'loop' || project.cameraPath.isLoop,
       speed: project.cameraPath.speed,
       models: mappedModels,
@@ -414,6 +404,9 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
     if (environment && includeEnv) {
       config.environment = {
         url: envPath,
+        // Additive: an older widget bundle ignores it and falls back to sniffing
+        // the URL, which is correct for every format it can decode.
+        format: envFormat,
         showBackground: environment.showBackground,
         useForReflection: environment.useForReflection,
         intensity: environment.intensity,
@@ -456,7 +449,7 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
   document.head.appendChild(s);
 })();
 <\/script>`;
-  }, [project, exportMode, transparent, resolutionId, models, scriptUrl, baseUrl, environment, includeEnv, envPath]);
+  }, [project, exportMode, transparent, resolutionId, models, scriptUrl, baseUrl, environment, envFormat, includeEnv, envPath]);
 
   const handleCopy = useCallback(async () => {
     await navigator.clipboard.writeText(getEmbedCode());
@@ -624,13 +617,10 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
         </DialogHeader>
 
         {!hasEnoughKeyframes && (
-          <div className="mx-6 mt-4 flex shrink-0 items-start gap-2 rounded-md border border-orange-500/40 bg-orange-500/10 p-3 text-xs text-orange-300">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-            <span>
-              Dieses Projekt hat weniger als 2 Keyframes. Ohne Kamerafahrt bewegt sich die Kamera
-              nicht. Erstelle zuerst im Keyframe-Editor mindestens 2 Keyframes.
-            </span>
-          </div>
+          <Notice variant="warning" className="mx-6 mt-4 shrink-0">
+            Dieses Projekt hat weniger als 2 Keyframes. Ohne Kamerafahrt bewegt sich die Kamera
+            nicht. Erstelle zuerst im Keyframe-Editor mindestens 2 Keyframes.
+          </Notice>
         )}
 
         <Tabs
@@ -853,10 +843,7 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
                   </pre>
                 )}
                 {uploadError && (
-                  <div className="flex items-start gap-2 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-xs text-red-300">
-                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                    <span>Upload fehlgeschlagen: {uploadError}</span>
-                  </div>
+                  <Notice variant="error">Upload fehlgeschlagen: {uploadError}</Notice>
                 )}
               </div>
 
@@ -937,12 +924,40 @@ export function ExportDialog({ open, onOpenChange, project }: ExportDialogProps)
                       </InfoHint>
                     </div>
                     <div className="flex items-center gap-2 rounded-md bg-secondary px-3 py-2">
-                      <span className="min-w-0 flex-1 truncate text-xs">{environment.fileName}</span>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-xs">{environment.fileName}</p>
+                        <p className="truncate text-[11px] text-muted-foreground">
+                          {formatBytes(envBytes)}
+                          {environment.width ? ` · ${environment.width} × ${environment.height}` : ''}
+                          {envFormat ? ` · ${ENVIRONMENT_FORMAT_LABEL[envFormat]}` : ''}
+                        </p>
+                      </div>
                       <Button variant="ghost" size="sm" className="shrink-0" onClick={downloadEnv}>
                         <Download className="mr-1 h-3.5 w-3.5" />
                         {envFileName}
                       </Button>
                     </div>
+                    {envOversized && (
+                      <div className="flex items-center gap-1.5 text-xs text-orange-400">
+                        <span>HDRI über 20 MiB</span>
+                        <InfoHint variant="warning" label="Große Umgebung">
+                          Dateien über 20&nbsp;MiB werden von jsDelivr mit 403 abgelehnt. Der
+                          Embed-Code lädt die Umgebung daher über{' '}
+                          <code>raw.githubusercontent.com</code> (funktioniert, ist aber kein CDN).
+                          Besser: die Umgebung im Eigenschaften-Panel über „Bild ersetzen“ auf
+                          1024&nbsp;× 512 umrechnen.
+                        </InfoHint>
+                      </div>
+                    )}
+                    {envFormat === 'ultrahdr' && (
+                      <Notice variant="warning">
+                        <strong>Diese Umgebung ist ein Ultra HDR JPEG.</strong> Nur ein neu gebauter
+                        Widget-Build kann sie mit vollem HDR-Bereich lesen. Führe{' '}
+                        <code>npm run build:widget</code> aus und lade{' '}
+                        <code>dist-widget/web3d-widget.iife.js</code> mit hoch – bereits eingebettete
+                        Widgets zeigen sonst nur die flachere SDR-Basis.
+                      </Notice>
+                    )}
                     {supportsFsAccess && (
                       <Button variant="outline" size="sm" className="w-full" onClick={saveEnvToFolder}>
                         <FolderDown className="mr-2 h-4 w-4" />

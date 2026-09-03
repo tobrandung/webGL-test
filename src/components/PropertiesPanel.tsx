@@ -5,19 +5,37 @@ import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
-import { ImageUp } from 'lucide-react';
-import { cn } from '@/lib/utils';
-import type { LightEntry, EnvironmentConfig } from '@/lib/db';
+import { Camera, Copy, Crosshair, ImageUp, Trash2 } from 'lucide-react';
+import { InfoHint } from '@/components/ui/info-hint';
+import { cn, formatBytes } from '@/lib/utils';
+import { environmentFormat, type LightEntry, type EnvironmentConfig } from '@/lib/db';
+import { BUDGET_OK } from '@/lib/hdri/budget';
+import { ENVIRONMENT_FORMAT_LABEL } from '@/lib/hdri/format';
+import type { Keyframe, KeyframePart } from '@/three/camera-path';
+
+export type KeyframeSelection = {
+  keyframe: Keyframe;
+  /** 1-based position in the path, for labelling. */
+  index: number;
+  part: KeyframePart;
+};
 
 type PropertiesPanelProps = {
   light: LightEntry | null;
   environment: EnvironmentConfig | null;
   /** Non-null when the world/background entry is selected. */
   background: string | null;
+  keyframe: KeyframeSelection | null;
   onUpdateLight: (id: string, patch: Partial<LightEntry>) => void;
   onUpdateEnvironment: (patch: Partial<EnvironmentConfig>) => void;
   onReplaceEnvironment: () => void;
   onUpdateBackground: (color: string) => void;
+  onUpdateKeyframe: (id: string, patch: Partial<Omit<Keyframe, 'id'>>) => void;
+  onSelectKeyframePart: (id: string, part: KeyframePart) => void;
+  onCaptureKeyframeFromCamera: (id: string) => void;
+  onJumpToKeyframe: (id: string) => void;
+  onDuplicateKeyframe: (id: string) => void;
+  onDeleteKeyframe: (id: string) => void;
 };
 
 const RAD_TO_DEG = 180 / Math.PI;
@@ -40,10 +58,17 @@ export function PropertiesPanel({
   light,
   environment,
   background,
+  keyframe,
   onUpdateLight,
   onUpdateEnvironment,
   onReplaceEnvironment,
   onUpdateBackground,
+  onUpdateKeyframe,
+  onSelectKeyframePart,
+  onCaptureKeyframeFromCamera,
+  onJumpToKeyframe,
+  onDuplicateKeyframe,
+  onDeleteKeyframe,
 }: PropertiesPanelProps) {
   return (
     <div className="absolute right-0 top-[49px] z-10 flex h-[calc(100%-49px)] w-[260px] flex-col border-l bg-background/95 backdrop-blur-sm">
@@ -58,6 +83,17 @@ export function PropertiesPanel({
           <WorldProperties background={background} onUpdate={onUpdateBackground} />
         )}
         {light && <LightProperties light={light} onUpdate={onUpdateLight} />}
+        {keyframe && (
+          <KeyframeProperties
+            selection={keyframe}
+            onUpdate={onUpdateKeyframe}
+            onSelectPart={onSelectKeyframePart}
+            onCaptureFromCamera={onCaptureKeyframeFromCamera}
+            onJumpTo={onJumpToKeyframe}
+            onDuplicate={onDuplicateKeyframe}
+            onDelete={onDeleteKeyframe}
+          />
+        )}
         {environment && (
           <EnvironmentProperties
             environment={environment}
@@ -129,6 +165,10 @@ function WorldProperties({
 
   useEffect(() => {
     setHexDraft(background);
+    // Follow externally applied greys (undo/redo) so the thumb keeps matching
+    // the colour it produced. The mode is left alone — which card is
+    // highlighted stays the user's choice.
+    if (isPureGray(background)) setGraySliderValue(hexToGrayChannel(background));
   }, [background]);
 
   const applyGray = (value: number) => {
@@ -362,8 +402,22 @@ function EnvironmentProperties({
     <>
       <Row>
         <Label className="text-xs">Bild</Label>
-        <div className="flex items-center gap-2 rounded-md bg-secondary px-2 py-1.5">
-          <span className="min-w-0 flex-1 truncate text-xs">{environment.fileName}</span>
+        <div className="rounded-md bg-secondary px-2 py-1.5">
+          <p className="truncate text-xs" title={environment.sourceFileName ?? environment.fileName}>
+            {environment.fileName}
+          </p>
+          <p className="flex items-center gap-1 truncate text-[11px] text-muted-foreground">
+            {environment.fileSize !== undefined && formatBytes(environment.fileSize)}
+            {environment.width ? ` · ${environment.width} × ${environment.height}` : ''}
+            {` · ${ENVIRONMENT_FORMAT_LABEL[environmentFormat(environment)]}`}
+            {environment.fileSize !== undefined && environment.fileSize > BUDGET_OK && (
+              <InfoHint variant="warning" label="Große Umgebung">
+                Diese Umgebung ist für ein Web-Widget groß – sie wird beim Export mitgeliefert und
+                von jedem Besucher geladen. Über „Bild ersetzen“ lässt sie sich auf 1024 × 512
+                umrechnen; für Spiegelungen bleibt die Qualität praktisch identisch.
+              </InfoHint>
+            )}
+          </p>
         </div>
         <Button variant="outline" size="sm" className="w-full" onClick={onReplace}>
           <ImageUp className="mr-2 h-3.5 w-3.5" />
@@ -416,6 +470,182 @@ function EnvironmentProperties({
           />
         </Row>
       )}
+    </>
+  );
+}
+
+const AXES = ['X', 'Y', 'Z'] as const;
+
+/** Trims float noise so a gizmo drag doesn't fill the fields with 14 digits. */
+function formatAxis(value: number): string {
+  return Number(value.toFixed(3)).toString();
+}
+
+/**
+ * Three numeric axis fields committing on blur/Enter — the same draft pattern
+ * the hex field uses, so a half-typed value never reaches the scene.
+ */
+function Vec3Field({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: [number, number, number];
+  onChange: (next: [number, number, number]) => void;
+}) {
+  const [drafts, setDrafts] = useState<string[]>(() => value.map(formatAxis));
+  const [focusedAxis, setFocusedAxis] = useState<number | null>(null);
+
+  // Mirror external changes (gizmo drag) into the fields without clobbering
+  // the axis the user is typing in.
+  useEffect(() => {
+    setDrafts((prev) => value.map((v, i) => (i === focusedAxis ? prev[i] : formatAxis(v))));
+  }, [value, focusedAxis]);
+
+  const commit = (index: number, raw: string) => {
+    const parsed = Number.parseFloat(raw.replace(',', '.'));
+    if (!Number.isFinite(parsed)) {
+      setDrafts((prev) => prev.map((d, i) => (i === index ? formatAxis(value[i]) : d)));
+      return;
+    }
+    setDrafts((prev) => prev.map((d, i) => (i === index ? formatAxis(parsed) : d)));
+    if (parsed === value[index]) return;
+    const next: [number, number, number] = [...value];
+    next[index] = parsed;
+    onChange(next);
+  };
+
+  return (
+    <Row>
+      <Label className="text-xs">{label}</Label>
+      <div className="grid grid-cols-3 gap-1">
+        {AXES.map((axis, index) => (
+          <div key={axis} className="relative">
+            <span className="pointer-events-none absolute left-1.5 top-1/2 -translate-y-1/2 text-[10px] font-medium text-muted-foreground">
+              {axis}
+            </span>
+            <Input
+              value={drafts[index] ?? ''}
+              onChange={(e) =>
+                setDrafts((prev) => prev.map((d, i) => (i === index ? e.target.value : d)))
+              }
+              onFocus={() => setFocusedAxis(index)}
+              onBlur={(e) => {
+                setFocusedAxis(null);
+                commit(index, e.target.value);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') e.currentTarget.blur();
+              }}
+              inputMode="decimal"
+              spellCheck={false}
+              className="pl-5 font-mono text-xs"
+              aria-label={`${label} ${axis}`}
+            />
+          </div>
+        ))}
+      </div>
+    </Row>
+  );
+}
+
+function KeyframeProperties({
+  selection,
+  onUpdate,
+  onSelectPart,
+  onCaptureFromCamera,
+  onJumpTo,
+  onDuplicate,
+  onDelete,
+}: {
+  selection: KeyframeSelection;
+  onUpdate: (id: string, patch: Partial<Omit<Keyframe, 'id'>>) => void;
+  onSelectPart: (id: string, part: KeyframePart) => void;
+  onCaptureFromCamera: (id: string) => void;
+  onJumpTo: (id: string) => void;
+  onDuplicate: (id: string) => void;
+  onDelete: (id: string) => void;
+}) {
+  const { keyframe, index, part } = selection;
+
+  return (
+    <>
+      <p className="text-xs text-muted-foreground">Keyframe {index}</p>
+
+      <div className="grid grid-cols-2 gap-1">
+        <Button
+          variant={part === 'position' ? 'secondary' : 'outline'}
+          size="sm"
+          onClick={() => onSelectPart(keyframe.id, 'position')}
+        >
+          Kamera
+        </Button>
+        <Button
+          variant={part === 'lookAt' ? 'secondary' : 'outline'}
+          size="sm"
+          onClick={() => onSelectPart(keyframe.id, 'lookAt')}
+        >
+          Blickpunkt
+        </Button>
+      </div>
+
+      <Vec3Field
+        label="Kameraposition"
+        value={keyframe.position}
+        onChange={(position) => onUpdate(keyframe.id, { position })}
+      />
+      <Vec3Field
+        label="Blickpunkt"
+        value={keyframe.lookAt}
+        onChange={(lookAt) => onUpdate(keyframe.id, { lookAt })}
+      />
+
+      <Separator />
+
+      <div className="space-y-1.5">
+        <Button
+          variant="outline"
+          size="sm"
+          className="w-full justify-start"
+          onClick={() => onCaptureFromCamera(keyframe.id)}
+        >
+          <Camera className="mr-2 h-3.5 w-3.5" />
+          Aktuelle Ansicht übernehmen
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          className="w-full justify-start"
+          onClick={() => onJumpTo(keyframe.id)}
+        >
+          <Crosshair className="mr-2 h-3.5 w-3.5" />
+          Kamera hierher setzen
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          className="w-full justify-start"
+          onClick={() => onDuplicate(keyframe.id)}
+        >
+          <Copy className="mr-2 h-3.5 w-3.5" />
+          Duplizieren
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          className="w-full justify-start text-red-400 hover:text-red-300"
+          onClick={() => onDelete(keyframe.id)}
+        >
+          <Trash2 className="mr-2 h-3.5 w-3.5" />
+          Löschen
+        </Button>
+      </div>
+
+      <p className="text-[11px] text-muted-foreground">
+        Marker im Viewport per Verschieben-Gizmo ziehen — der rote Punkt ist die Kamera, der grüne
+        der Blickpunkt.
+      </p>
     </>
   );
 }
