@@ -16,6 +16,18 @@ import { ExportDialog } from '@/components/ExportDialog';
 import { useProjects } from '@/hooks/useProjects';
 import type { Project } from '@/lib/db';
 
+
+/** Logo-über-Name-Lockup fürs Hauptmenü. `lg` für den leeren Zustand (zentriert, größer). */
+function Brand({ size = 'md' }: { size?: 'md' | 'lg' }) {
+  const large = size === 'lg';
+  return (
+    <div className={`flex flex-col ${large ? 'items-center gap-3' : 'items-start gap-1.5'}`}>
+      <img src="/brandung-logo.svg" alt="BRANDUNG" className={large ? 'h-8 w-auto' : 'h-5 w-auto'} />
+      <h1 className={`font-bold tracking-tight ${large ? 'text-4xl' : 'text-2xl'}`}>WebGL Studio</h1>
+    </div>
+  );
+}
+
 export function DashboardPage() {
   const navigate = useNavigate();
   const { projects, loading, createProject, updateProject, deleteProject, duplicateProject } = useProjects();
@@ -63,7 +75,7 @@ export function DashboardPage() {
     <div className="min-h-screen px-6 py-8 lg:px-8">
       {isEmpty ? (
         <div className="flex h-[calc(100vh-4rem)] flex-col items-center justify-center gap-6">
-          <h1 className="text-4xl font-bold tracking-tight">Web3D Studio</h1>
+          <Brand size="lg" />
           <p className="max-w-md text-center text-muted-foreground">
             Erstelle interaktive 3D-Erlebnisse mit Kamerafahrten und exportiere sie als embeddable
             Widget für deine Webprojekte.
@@ -76,7 +88,7 @@ export function DashboardPage() {
       ) : (
         <>
           <div className="mb-6 flex items-center justify-between">
-            <h1 className="text-2xl font-bold tracking-tight">Projekte</h1>
+            <Brand />
             <Button onClick={() => setShowNewDialog(true)}>
               <Plus className="mr-2 h-4 w-4" />
               Neues Projekt
